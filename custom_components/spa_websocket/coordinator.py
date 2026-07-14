@@ -87,7 +87,10 @@ class SpaConnection:
                     self._ws = ws
                     _LOGGER.info("Spa WebSocket connected to %s", self.url)
                     async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
+                        if msg.type in (
+                            aiohttp.WSMsgType.TEXT,
+                            aiohttp.WSMsgType.BINARY,
+                        ):
                             self._handle_message(msg.data)
                         elif msg.type in (
                             aiohttp.WSMsgType.CLOSED,
@@ -107,8 +110,13 @@ class SpaConnection:
             await asyncio.sleep(RECONNECT_DELAY)
 
     @callback
-    def _handle_message(self, raw: str) -> None:
+    def _handle_message(self, raw: str | bytes) -> None:
         """Parse an incoming message and update the jets state."""
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="ignore")
+
+        _LOGGER.debug("Spa frame received: %s", raw[:200])
+
         try:
             parsed = json.loads(raw)
         except (ValueError, TypeError):
@@ -123,6 +131,12 @@ class SpaConnection:
             return
 
         new_state = DSP_BYTE_TO_STATE.get(dsp.lower()[8:10], STATE_OFF)
+        _LOGGER.debug(
+            "Parsed dsp=%s byte[8:10]=%s -> %s",
+            dsp,
+            dsp.lower()[8:10],
+            STATE_NAMES[new_state],
+        )
         if new_state != self.jets_state:
             _LOGGER.info("Spa jets changed to: %s", STATE_NAMES[new_state])
             self.jets_state = new_state
