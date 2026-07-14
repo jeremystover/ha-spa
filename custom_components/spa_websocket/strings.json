@@ -1,0 +1,20 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Spa WebSocket",
+        "description": "Connect to your spa's WebSocket endpoint.",
+        "data": {
+          "name": "Name",
+          "url": "WebSocket URL (wss://...)"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "The URL must start with ws:// or wss://."
+    },
+    "abort": {
+      "already_configured": "This spa URL is already configured."
+    }
+  }
+}

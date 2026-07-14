@@ -1,0 +1,12 @@
+{
+  "domain": "spa_websocket",
+  "name": "Spa WebSocket",
+  "version": "1.0.0",
+  "config_flow": true,
+  "documentation": "https://github.com/jeremystover/ha-spa",
+  "issue_tracker": "https://github.com/jeremystover/ha-spa/issues",
+  "iot_class": "cloud_push",
+  "codeowners": ["@jeremystover"],
+  "dependencies": [],
+  "requirements": []
+}
