@@ -9,6 +9,12 @@ three-digit reading such as 101°F fills the fourth character.
 The panel is four wide, not three: it also shows words, e.g. ``54 5c 39 79``
 renders as ``ECon``.
 
+CAVEAT: this reads the display, and the display is multiplexed. At idle it shows
+the current water temperature, but while the set temperature is being adjusted
+it shows that instead, so a reading taken during an edit window is a setpoint,
+not water temperature. Words and blanked (flashing) frames are rejected, but a
+steady setpoint reading is indistinguishable from a water-temperature one.
+
 Bit 7 is the decimal point / degree indicator and is masked off before lookup.
 """
 
