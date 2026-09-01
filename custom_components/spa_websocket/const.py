@@ -61,7 +61,12 @@ ATTR_CODE = "code"
 PATH_APP = "app"
 PATH_SETTEMP = "settemp"
 
-# The limits the spa's own web app bounds its slider with:
+# The spa's own web app bounds its slider with
 #   templims = {f: {min: 45, max: 104}, c: {min: 7.6, max: 40}}
-MIN_TEMP_F = 45
+# The floor here is deliberately higher than the hardware's 45F. A 45F setpoint
+# parks the water on the freeze-protection trigger — the controller shows CoLd
+# below 40F and runs the pump until it recovers past 45F — which is fine to
+# touch briefly but not to hold overnight through a freezing winter. 65F keeps
+# the heater off during peak hours with real margin.
+MIN_TEMP_F = 65
 MAX_TEMP_F = 104
