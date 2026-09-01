@@ -61,7 +61,7 @@ ATTR_CODE = "code"
 PATH_APP = "app"
 PATH_SETTEMP = "settemp"
 
-# The controller rejects setpoints above 104F. The floor is not documented; 59F
-# is the usual ACC minimum, and the spa clamps anything it will not accept.
-MIN_TEMP_F = 59
+# The limits the spa's own web app bounds its slider with:
+#   templims = {f: {min: 45, max: 104}, c: {min: 7.6, max: 40}}
+MIN_TEMP_F = 45
 MAX_TEMP_F = 104
