@@ -1,7 +1,7 @@
 {
   "domain": "spa_websocket",
   "name": "Spa WebSocket",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "config_flow": true,
   "documentation": "https://github.com/jeremystover/ha-spa",
   "issue_tracker": "https://github.com/jeremystover/ha-spa/issues",
