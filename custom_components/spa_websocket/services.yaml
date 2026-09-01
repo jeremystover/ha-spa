@@ -1,0 +1,14 @@
+send_raw:
+  name: Send raw command
+  description: >-
+    Send a single raw command code to the spa over its WebSocket. Diagnostic
+    tool for mapping the spa's undocumented command codes (known so far:
+    "3" toggles jets, "4" toggles filter).
+  fields:
+    code:
+      name: Code
+      description: The raw command code to send, e.g. "3".
+      required: true
+      example: "3"
+      selector:
+        text:
