@@ -1,21 +1,22 @@
 """Decoding for the spa's seven-segment display buffer.
 
-The spa reports its topside panel as a ``dsp`` hex string. Bytes 0-3 are the
-four display characters as seven-segment bitmaps, stored right-to-left: byte 0
-is the rightmost character (the unit, ``F`` or ``C``), then ones, tens and
-hundreds. So ``f1 6d 6f 00`` renders as ``_`` ``9`` ``5`` ``F`` — 95°F, and a
-three-digit reading such as 101°F fills the fourth character.
+The spa reports its topside panel as a ``dsp`` hex string of six bytes. Bytes
+0-3 are the four display characters as seven-segment bitmaps; bytes 4 and 5 are
+LED bitfields (see ``const``).
 
-The panel is four wide, not three: it also shows words, e.g. ``54 5c 39 79``
-renders as ``ECon``.
+The digits sit in bytes 1 (ones) and 2 (tens). The scale marker and the hundreds
+digit occupy bytes 0 and 3, and which is which depends on the layout the panel
+is using — the spa's own web app detects the scale by testing byte 0 for ``f1``
+/ ``b9`` or byte 3 for ``ce`` / ``8f``. So ``f1 6d 6f 00`` is 95°F and
+``00 6f 7d ce`` is 69°F.
+
+Bit 7 is the decimal point / degree indicator and is masked off before lookup.
 
 CAVEAT: this reads the display, and the display is multiplexed. At idle it shows
 the current water temperature, but while the set temperature is being adjusted
-it shows that instead, so a reading taken during an edit window is a setpoint,
-not water temperature. Words and blanked (flashing) frames are rejected, but a
-steady setpoint reading is indistinguishable from a water-temperature one.
-
-Bit 7 is the decimal point / degree indicator and is masked off before lookup.
+it shows that instead. Callers should check the edit LED (``FLAG_EDIT`` in byte
+4) to tell the two apart rather than trusting every reading as water
+temperature.
 """
 
 from __future__ import annotations
@@ -34,17 +35,28 @@ SEGMENTS_TO_DIGIT = {
     0x6F: 9,
 }
 
-# Unit characters in the rightmost position.
+# Scale marker in byte 0, masked of its degree bit.
 SEGMENTS_TO_UNIT = {
     0x71: "F",
     0x39: "C",
 }
 
+# Scale marker in byte 3, matched unmasked as the spa's web app does.
+ALT_SEGMENTS_TO_UNIT = {
+    0xCE: "F",
+    0x8F: "C",
+}
+
 # Bit 7 carries the decimal point / degree marker, not a segment.
 SEGMENT_MASK = 0x7F
 
-# No segments lit — the leading character of a two-digit reading.
+# No segments lit — a leading blank.
 BLANK = 0x00
+
+
+def _digit(raw: int) -> int | None:
+    """Return the digit a segment bitmap draws, or None."""
+    return SEGMENTS_TO_DIGIT.get(raw & SEGMENT_MASK)
 
 
 def decode_temperature(dsp: str) -> tuple[int, str] | None:
@@ -62,21 +74,23 @@ def decode_temperature(dsp: str) -> tuple[int, str] | None:
     except ValueError:
         return None
 
-    unit = SEGMENTS_TO_UNIT.get(raw[0] & SEGMENT_MASK)
-    ones = SEGMENTS_TO_DIGIT.get(raw[1] & SEGMENT_MASK)
-    tens = SEGMENTS_TO_DIGIT.get(raw[2] & SEGMENT_MASK)
-
-    if unit is None or ones is None or tens is None:
+    # The scale marker sits at one end or the other; the opposite end is then
+    # the hundreds digit.
+    if (unit := SEGMENTS_TO_UNIT.get(raw[0] & SEGMENT_MASK)) is not None:
+        leading = raw[3]
+    elif (unit := ALT_SEGMENTS_TO_UNIT.get(raw[3])) is not None:
+        leading = raw[0]
+    else:
         return None
 
-    # The leading character is blank for a two-digit reading and carries the
-    # hundreds digit for three-digit ones such as 101F.
-    leading = raw[3] & SEGMENT_MASK
-    if leading == BLANK:
+    ones = _digit(raw[1])
+    tens = _digit(raw[2])
+    if ones is None or tens is None:
+        return None
+
+    if leading & SEGMENT_MASK == BLANK:
         hundreds = 0
-    else:
-        hundreds = SEGMENTS_TO_DIGIT.get(leading)
-        if hundreds is None:
-            return None
+    elif (hundreds := _digit(leading)) is None:
+        return None
 
     return hundreds * 100 + tens * 10 + ones, unit

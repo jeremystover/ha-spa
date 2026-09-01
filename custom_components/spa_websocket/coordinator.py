@@ -16,11 +16,18 @@ from collections.abc import Callable
 import aiohttp
 
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import (
+    async_create_clientsession,
+    async_get_clientsession,
+)
 
 from .const import (
-    DSP_BYTE_TO_STATE,
+    DSP_FLAG_TO_STATE,
+    FLAG_EDIT,
     HEARTBEAT,
+    PATH_APP,
+    PATH_SETTEMP,
     RECONNECT_DELAY,
     STATE_NAMES,
     STATE_OFF,
@@ -50,6 +57,46 @@ class SpaConnection:
         self._task: asyncio.Task | None = None
         self._closing = False
         self._listeners: list[Callable[[], None]] = []
+        # Its own cookie jar: the settemp POST is authenticated by a session
+        # cookie that must not leak into Home Assistant's shared session.
+        self._http = async_create_clientsession(hass)
+
+    @property
+    def _base_url(self) -> str:
+        """Return the HTTP base for this spa, derived from the socket URL.
+
+        ``wss://host/spa/<token>/wsb`` -> ``https://host/spa/<token>``
+        """
+        base = self.url.replace("wss://", "https://").replace("ws://", "http://")
+        return base.rsplit("/", 1)[0]
+
+    async def async_set_temperature(self, temperature: int) -> None:
+        """Set the spa's target temperature.
+
+        Temperature is not a WebSocket command. It is a form POST, authenticated
+        by a session cookie that the app page issues and that expires after about
+        an hour, so the cookie is minted fresh rather than stored.
+        """
+        base = self._base_url
+        payload = {
+            "flip-scale": "0",
+            "void": str(temperature),
+            "temp": str(temperature),
+        }
+
+        try:
+            await self._http.get(f"{base}/{PATH_APP}")
+            async with self._http.post(
+                f"{base}/{PATH_SETTEMP}", data=payload
+            ) as resp:
+                if resp.status != 200:
+                    raise HomeAssistantError(
+                        f"Spa rejected setpoint {temperature}: HTTP {resp.status}"
+                    )
+        except aiohttp.ClientError as err:
+            raise HomeAssistantError(f"Could not reach the spa: {err}") from err
+
+        _LOGGER.info("Spa target temperature set to %s", temperature)
 
     @callback
     def add_listener(self, update_callback: Callable[[], None]) -> Callable[[], None]:
@@ -145,28 +192,31 @@ class SpaConnection:
 
         dsp = parsed.get("dsp") if isinstance(parsed, dict) else None
 
-        if isinstance(dsp, str):
-            reading = decode_temperature(dsp)
-            if reading is not None and (
-                reading[0],
-                reading[1],
-            ) != (self.temperature, self.temperature_unit):
-                self.temperature, self.temperature_unit = reading
-                _LOGGER.debug("Spa temperature: %s°%s", *reading)
-                changed = True
-
         # Ignore all-zero / too-short frames, matching the original plugin.
-        if isinstance(dsp, str) and len(dsp) >= 10 and dsp.strip("0") != "":
-            new_state = DSP_BYTE_TO_STATE.get(dsp.lower()[8:10], STATE_OFF)
-            _LOGGER.debug(
-                "Parsed dsp=%s byte[8:10]=%s -> %s",
-                dsp,
-                dsp.lower()[8:10],
-                STATE_NAMES[new_state],
-            )
+        if isinstance(dsp, str) and len(dsp) >= 12 and dsp.strip("0") != "":
+            flags = int(dsp[8:10], 16)
+
+            new_state = STATE_OFF
+            for flag, state in DSP_FLAG_TO_STATE:
+                if flags & flag:
+                    new_state = state
+                    break
             if new_state != self.jets_state:
                 _LOGGER.info("Spa jets changed to: %s", STATE_NAMES[new_state])
                 self.jets_state = new_state
+                changed = True
+
+            # While the edit LED is lit the panel is showing the set temperature
+            # rather than the water temperature, so that reading is not what the
+            # temperature sensor reports.
+            editing = bool(flags & FLAG_EDIT)
+            reading = decode_temperature(dsp)
+            if reading is not None and not editing and reading != (
+                self.temperature,
+                self.temperature_unit,
+            ):
+                self.temperature, self.temperature_unit = reading
+                _LOGGER.debug("Spa temperature: %s°%s", *reading)
                 changed = True
 
         if changed:
