@@ -50,3 +50,8 @@ class SpaJetsSensor(SensorEntity):
     def native_value(self) -> str:
         """Return the current jets state name."""
         return STATE_NAMES.get(self._connection.jets_state, STATE_NAMES[STATE_OFF])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        """Expose the last raw frame for protocol inspection."""
+        return {"last_frame": self._connection.last_frame}

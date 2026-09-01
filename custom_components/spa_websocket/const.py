@@ -30,3 +30,12 @@ DSP_BYTE_TO_STATE = {
 
 # How long to wait before reconnecting after the socket drops.
 RECONNECT_DELAY = 5
+
+# WebSocket ping interval. The relay closes idle connections after ~60s, which
+# left the socket down for part of every minute and dropped commands sent in
+# the gap.
+HEARTBEAT = 20
+
+# Diagnostic service for probing the spa's undocumented command codes.
+SERVICE_SEND_RAW = "send_raw"
+ATTR_CODE = "code"

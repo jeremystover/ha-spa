@@ -18,7 +18,13 @@ import aiohttp
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DSP_BYTE_TO_STATE, RECONNECT_DELAY, STATE_NAMES, STATE_OFF
+from .const import (
+    DSP_BYTE_TO_STATE,
+    HEARTBEAT,
+    RECONNECT_DELAY,
+    STATE_NAMES,
+    STATE_OFF,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +37,9 @@ class SpaConnection:
         self.hass = hass
         self.url = url
         self.jets_state: int = STATE_OFF
+        # Most recent raw frame, surfaced as a diagnostic attribute so the
+        # protocol can be inspected without turning on debug logging.
+        self.last_frame: str | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._task: asyncio.Task | None = None
         self._closing = False
@@ -83,7 +92,7 @@ class SpaConnection:
         session = async_get_clientsession(self.hass)
         while not self._closing:
             try:
-                async with session.ws_connect(self.url) as ws:
+                async with session.ws_connect(self.url, heartbeat=HEARTBEAT) as ws:
                     self._ws = ws
                     _LOGGER.info("Spa WebSocket connected to %s", self.url)
                     async for msg in ws:
@@ -117,27 +126,32 @@ class SpaConnection:
 
         _LOGGER.debug("Spa frame received: %s", raw[:200])
 
+        # Record every frame, including shapes this integration does not parse
+        # yet — the spa's protocol is undocumented and the unparsed frames are
+        # where the temperature readout is expected to live.
+        changed = raw != self.last_frame
+        self.last_frame = raw
+
         try:
             parsed = json.loads(raw)
         except (ValueError, TypeError):
-            return
+            parsed = None
 
         dsp = parsed.get("dsp") if isinstance(parsed, dict) else None
-        if not isinstance(dsp, str):
-            return
 
         # Ignore all-zero / too-short frames, matching the original plugin.
-        if len(dsp) < 10 or dsp.strip("0") == "":
-            return
+        if isinstance(dsp, str) and len(dsp) >= 10 and dsp.strip("0") != "":
+            new_state = DSP_BYTE_TO_STATE.get(dsp.lower()[8:10], STATE_OFF)
+            _LOGGER.debug(
+                "Parsed dsp=%s byte[8:10]=%s -> %s",
+                dsp,
+                dsp.lower()[8:10],
+                STATE_NAMES[new_state],
+            )
+            if new_state != self.jets_state:
+                _LOGGER.info("Spa jets changed to: %s", STATE_NAMES[new_state])
+                self.jets_state = new_state
+                changed = True
 
-        new_state = DSP_BYTE_TO_STATE.get(dsp.lower()[8:10], STATE_OFF)
-        _LOGGER.debug(
-            "Parsed dsp=%s byte[8:10]=%s -> %s",
-            dsp,
-            dsp.lower()[8:10],
-            STATE_NAMES[new_state],
-        )
-        if new_state != self.jets_state:
-            _LOGGER.info("Spa jets changed to: %s", STATE_NAMES[new_state])
-            self.jets_state = new_state
+        if changed:
             self._notify_listeners()
