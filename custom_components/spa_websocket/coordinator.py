@@ -25,6 +25,7 @@ from .const import (
     STATE_NAMES,
     STATE_OFF,
 )
+from .decode import decode_temperature
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +41,11 @@ class SpaConnection:
         # Most recent raw frame, surfaced as a diagnostic attribute so the
         # protocol can be inspected without turning on debug logging.
         self.last_frame: str | None = None
+        # Last successfully decoded display reading. The panel cycles through
+        # states the decoder does not read as a temperature, so the last good
+        # value is kept rather than flapping to unknown between frames.
+        self.temperature: int | None = None
+        self.temperature_unit: str | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._task: asyncio.Task | None = None
         self._closing = False
@@ -138,6 +144,16 @@ class SpaConnection:
             parsed = None
 
         dsp = parsed.get("dsp") if isinstance(parsed, dict) else None
+
+        if isinstance(dsp, str):
+            reading = decode_temperature(dsp)
+            if reading is not None and (
+                reading[0],
+                reading[1],
+            ) != (self.temperature, self.temperature_unit):
+                self.temperature, self.temperature_unit = reading
+                _LOGGER.debug("Spa temperature: %s°%s", *reading)
+                changed = True
 
         # Ignore all-zero / too-short frames, matching the original plugin.
         if isinstance(dsp, str) and len(dsp) >= 10 and dsp.strip("0") != "":
