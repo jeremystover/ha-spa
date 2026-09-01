@@ -12,7 +12,7 @@ from homeassistant.helpers import config_validation as cv
 from .const import ATTR_CODE, CONF_URL, DOMAIN, SERVICE_SEND_RAW
 from .coordinator import SpaConnection
 
-PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.NUMBER, Platform.SENSOR]
 
 SEND_RAW_SCHEMA = vol.Schema({vol.Required(ATTR_CODE): cv.string})
 
