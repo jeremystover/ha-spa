@@ -25,6 +25,7 @@ from homeassistant.helpers.aiohttp_client import (
 from .const import (
     DSP_FLAG_TO_STATE,
     FLAG_EDIT,
+    FLAG_HEATING,
     HEARTBEAT,
     PATH_APP,
     PATH_SETTEMP,
@@ -53,6 +54,10 @@ class SpaConnection:
         # value is kept rather than flapping to unknown between frames.
         self.temperature: int | None = None
         self.temperature_unit: str | None = None
+        # Whether the heater element is currently firing. The spa only heats
+        # while its filter pump is running, so this doubles as the signal that a
+        # filter cycle is actually overlapping the setpoint we asked for.
+        self.heating: bool = False
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._task: asyncio.Task | None = None
         self._closing = False
@@ -204,6 +209,12 @@ class SpaConnection:
             if new_state != self.jets_state:
                 _LOGGER.info("Spa jets changed to: %s", STATE_NAMES[new_state])
                 self.jets_state = new_state
+                changed = True
+
+            heating = bool(flags & FLAG_HEATING)
+            if heating != self.heating:
+                _LOGGER.info("Spa heater %s", "on" if heating else "off")
+                self.heating = heating
                 changed = True
 
             # While the edit LED is lit the panel is showing the set temperature
