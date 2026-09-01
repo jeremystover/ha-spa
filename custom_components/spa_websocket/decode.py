@@ -1,9 +1,13 @@
 """Decoding for the spa's seven-segment display buffer.
 
-The spa reports its topside panel as a ``dsp`` hex string. Bytes 0-2 are the
-three display characters as seven-segment bitmaps, stored right-to-left: byte 0
-is the rightmost character (the unit, ``F`` or ``C``), byte 1 the ones digit and
-byte 2 the tens digit. So ``f1 6d 6f`` renders as ``9`` ``5`` ``F`` — 95°F.
+The spa reports its topside panel as a ``dsp`` hex string. Bytes 0-3 are the
+four display characters as seven-segment bitmaps, stored right-to-left: byte 0
+is the rightmost character (the unit, ``F`` or ``C``), then ones, tens and
+hundreds. So ``f1 6d 6f 00`` renders as ``_`` ``9`` ``5`` ``F`` — 95°F, and a
+three-digit reading such as 101°F fills the fourth character.
+
+The panel is four wide, not three: it also shows words, e.g. ``54 5c 39 79``
+renders as ``ECon``.
 
 Bit 7 is the decimal point / degree indicator and is masked off before lookup.
 """
@@ -33,19 +37,22 @@ SEGMENTS_TO_UNIT = {
 # Bit 7 carries the decimal point / degree marker, not a segment.
 SEGMENT_MASK = 0x7F
 
+# No segments lit — the leading character of a two-digit reading.
+BLANK = 0x00
+
 
 def decode_temperature(dsp: str) -> tuple[int, str] | None:
     """Return ``(temperature, unit)`` from a ``dsp`` hex string, or None.
 
-    Returns None whenever the buffer does not hold a readable two-digit
-    temperature — a blank display, a scrolling status message, or a frame
-    shorter than the three characters this reads.
+    Returns None whenever the buffer does not hold a readable temperature — a
+    blank display, a word such as ``ECon``, or a frame shorter than the four
+    characters this reads.
     """
-    if len(dsp) < 6:
+    if len(dsp) < 8:
         return None
 
     try:
-        raw = bytes.fromhex(dsp[:6])
+        raw = bytes.fromhex(dsp[:8])
     except ValueError:
         return None
 
@@ -56,4 +63,14 @@ def decode_temperature(dsp: str) -> tuple[int, str] | None:
     if unit is None or ones is None or tens is None:
         return None
 
-    return tens * 10 + ones, unit
+    # The leading character is blank for a two-digit reading and carries the
+    # hundreds digit for three-digit ones such as 101F.
+    leading = raw[3] & SEGMENT_MASK
+    if leading == BLANK:
+        hundreds = 0
+    else:
+        hundreds = SEGMENTS_TO_DIGIT.get(leading)
+        if hundreds is None:
+            return None
+
+    return hundreds * 100 + tens * 10 + ones, unit
