@@ -1,58 +1,155 @@
 # Spa WebSocket — Home Assistant integration
 
-A Home Assistant custom integration that controls a spa over its WebSocket
-endpoint (`wss://…/ws`). It's a port of the `homebridge-spa-jets` Homebridge
-plugin: single-character commands toggle the jets and filter, and incoming
-`{"dsp": "<hex>"}` status frames report the jets state.
+Controls an **ACC (Applied Computer Controls) SmarTouch** spa through a
+**WF-100 SmartLink** WiFi module, relayed via `accsmartlink.com`.
+
+Originally a port of the `homebridge-spa-jets` Homebridge plugin (two buttons
+and a jets sensor). It has since grown a decoded temperature readout, an
+absolute setpoint control, a heater sensor, and a clock setter — see
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) for how each was worked out.
 
 ## What it creates
 
-One WebSocket connection is shared by three entities grouped under a single
-device:
+One shared, auto-reconnecting WebSocket, plus a short-lived HTTPS session for
+the one thing that isn't a socket command.
 
 | Entity | Type | Behavior |
 | --- | --- | --- |
-| **Jets** | `button` | Press → sends `"3"` (toggle jets) |
-| **Filter** | `button` | Press → sends `"4"` (toggle filter) |
-| **Jets status** | `sensor` (enum) | Reports `Off` / `Low` / `High` / `Filtering` |
+| **Jets** | `button` | Sends `"3"` |
+| **Filter** | `button` | Sends `"4"` — the web app calls this code `system` |
+| **Jets status** | `sensor` (enum) | `Off` / `Low` / `High` / `Filtering` |
+| **Temperature** | `sensor` | Water temperature, decoded from the panel display |
+| **Target temperature** | `number` | Setpoint, 65–104 °F |
+| **Heating** | `binary_sensor` | Whether the heater element is firing |
 
-## Install via HACS (recommended)
+### Services
 
-1. In Home Assistant, open **HACS**.
-2. Top-right **⋮ menu → Custom repositories**.
-3. Add `https://github.com/jeremystover/ha-spa`, category **Integration**,
-   then **Add**.
-4. Search HACS for **Spa WebSocket**, open it, and click **Download**.
-5. **Restart Home Assistant** (Settings → System → top-right ⋮ → Restart).
-6. **Settings → Devices & services → Add integration → Spa WebSocket**, and
-   paste your spa's `wss://…/ws` URL.
+| Service | Fields | Purpose |
+| --- | --- | --- |
+| `spa_websocket.set_time` | `timezone` (optional IANA name) | Sets the panel clock |
+| `spa_websocket.send_raw` | `code` | Diagnostic — sends one raw frame |
 
-## Manual install
+`set_time` defaults to Home Assistant's own timezone, which is correct only if
+the spa sits in the same zone as the HA host. Pass the zone explicitly if not.
 
-Copy `custom_components/spa_websocket` into your Home Assistant config
-directory so it lands at `<config>/custom_components/spa_websocket/`, restart,
-then add the integration as in step 6 above.
+## Install
 
-No YAML editing and no extra Python dependencies — the integration uses Home
-Assistant's bundled `aiohttp` client.
+**Via HACS:** ⋮ → Custom repositories → add
+`https://github.com/jeremystover/ha-spa` as an **Integration** → download →
+restart → Settings → Devices & services → Add integration → Spa WebSocket.
 
-## How this maps from the Homebridge plugin
+Configuration takes one value: the spa's WebSocket URL, of the form
+`wss://accsmartlink.com/spa/<token>/wsb`.
 
-- The two momentary "revert-to-off" switches (`SpaJets`, `SpaFilter`) become
-  `button` entities. Home Assistant's button domain is stateless by design, so
-  the old 0.5-second revert hack is no longer needed — a press just fires once.
-- The read-only `Fanv2` accessory (`SpaStatus`) becomes an enum `sensor`. The
-  decoding is identical: byte 5 of the `dsp` hex string (`04` = Low,
-  `08` = High, `10` = Filtering, else Off).
-- The three separate sockets in the plugin are collapsed into one shared,
-  auto-reconnecting connection, with the same 5-second reconnect delay.
+> **The token in that URL is a credential.** Anyone holding it can control the
+> spa. Don't paste it into issues, PRs, logs, or screenshots.
 
-## Notes
+HACS tracks this repo by commit, not release. If an update doesn't appear,
+use ⋮ → **Update information** on the repository first.
 
-- The status sensor reads `Off` until the first `dsp` frame arrives after
-  startup.
-- To use the jets state in automations, trigger on the
-  `sensor.<name>_jets_status` state (e.g. `to: "High"`).
+## Home Assistant configuration
+
+The integration exposes capability; the schedule lives in Home Assistant. This
+is the setup it was built for — a spa on **America/Los_Angeles** whose Home
+Assistant runs on **America/Toronto**, three hours ahead. All times below are
+Home Assistant local.
+
+### Why the clock matters
+
+**The heater only runs while the filter pump is running.** Raising the setpoint
+outside a filter cycle does nothing at all. So the setpoint has to be raised
+*during* a filter cycle, and the filter cycles are programmed on the topside
+panel against the panel's own clock.
+
+That clock has no battery. After a power cut it comes back wrong, the filter
+window drifts away from the window Home Assistant raises the setpoint in, and
+the water quietly stops heating — no error anywhere, just a tub that never gets
+warm. Hence the clock sync below.
+
+Panel-side programming assumed here: **FP1 12:00–15:00** and **FP2 23:00–23:45**,
+both spa-local.
+
+### Helpers
+
+| Helper | Type | Purpose |
+| --- | --- | --- |
+| `input_boolean.hot_tub_schedule_hold` | Toggle | Manual override — suspends the schedule |
+| `sensor.<spa>_heat_window` | History stats | Hours the heater ran during the heat window |
+
+The history-stats helper watches the `Heating` binary sensor, state `on`, type
+`Time`, from `{{ today_at('15:00') }}` to `{{ today_at('18:00') }}`.
+
+### Automations
+
+| Automation | Trigger | Action |
+| --- | --- | --- |
+| Hot tub temperature schedule | Hourly at :00 | 101 °F within 15:00–18:00, else 65 °F |
+| Hot tub clock sync | Hourly at :30 | `set_time` with `America/Los_Angeles` |
+| Hot tub schedule hold — daily clear | 06:00 | Turns the hold off |
+| Hot tub heat window verification | 18:00 | Notifies if the heater never ran |
+
+### What happens each day
+
+| HA time | Spa time | What |
+| --- | --- | --- |
+| every :30 | — | Clock re-asserted, so drift costs at most an hour |
+| 06:00 | 03:00 | Peak ends; any manual hold is released |
+| 15:00 | 12:00 | FP1 starts **and** setpoint goes to 101 °F — they must coincide |
+| 15:00–18:00 | 12:00–15:00 | The only off-peak heating window |
+| 18:00 | 15:00 | Peak begins; setpoint drops to 65 °F |
+| 18:00 | 15:00 | Verification: alert if the heater never fired |
+| 23:00 | 20:00 | — |
+| 02:00 | 23:00 | FP2 runs, but it's inside peak, so the low setpoint keeps the heater off |
+
+### Design notes
+
+**Hourly, not once.** Every enforcement re-asserts rather than firing on a
+single edge, so a missed run — spa offline, expired relay session, HA restart —
+costs one hour instead of a whole day.
+
+**The clock is written, never checked.** It can't be read back: the display
+multiplexes to water temperature at idle. Writing the correct time to an
+already-correct clock changes nothing, which makes blind re-assertion safe and
+removes the need for a verify-then-fix path that the hardware can't support.
+
+**Verification is by consequence.** Since the clock is unreadable, the heat
+window sensor checks the thing the clock is supposed to produce — heater
+runtime. Zero runtime across a whole window means the cycle isn't overlapping.
+It uses `history_stats` rather than a `for:` duration because `for:` clocks
+reset on every restart and every `unavailable` blip.
+
+**The hold expires.** An open-ended override is a rental hazard — a guest flips
+it, leaves, and the tub heats through peak indefinitely. It clears at the end of
+peak, so it covers one night at most.
+
+## Known limitation: the window is too short to reach 101 °F
+
+A spa heater moves water roughly 5 °F/hour. A three-hour window from a 65 °F
+floor buys about 17 °F, so the tub arrives in the low 80s, not at 101 °F. FP1 is
+also the *only* off-peak filter cycle — FP2 sits inside peak — so there is no
+second heating opportunity in the day.
+
+Two ways to close the gap, both panel-side or one-line:
+
+- **Raise the floor** from 65 °F to 85–90 °F. The heater still never runs during
+  peak; each window just starts with less ground to make up.
+- **Start FP1 earlier.** Off-peak runs until 15:00 spa-local, so a 09:00–15:00
+  FP1 gives six hours of heating at no peak cost.
+
+The verification automation will tell you whether heat is happening at all; it
+deliberately does not alarm on merely falling short of target.
+
+## Reference
+
+- **ACC SmarTouch manuals** — [manufacturer PDF](http://acc-spas.com/site/wp-content/uploads/2016/04/smartouch-manual-acc.pdf),
+  [mirror](https://www.spaspecialist.com/ACCmanual-acc.pdf),
+  [ManualsLib](https://www.manualslib.com/manual/1578288/Acc-Smartouch-Digital-Series.html).
+  Covers panel programming, filter cycles, and error codes. These links are the
+  manufacturer's published locations; they were not fetchable from the
+  environment this was written in, so check them against your own hardware.
+- **[`docs/PROTOCOL.md`](docs/PROTOCOL.md)** — the wire protocol: display buffer
+  decoding, LED bitfields, the setpoint form POST, and the clock frame, with
+  notes on how each was derived and how to re-derive it.
 
 ## License
 
