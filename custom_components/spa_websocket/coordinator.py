@@ -55,9 +55,10 @@ class SpaConnection:
         # value is kept rather than flapping to unknown between frames.
         self.temperature: int | None = None
         self.temperature_unit: str | None = None
-        # Whether the heater element is currently firing. The spa only heats
-        # while its filter pump is running, so this doubles as the signal that a
-        # filter cycle is actually overlapping the setpoint we asked for.
+        # Whether the heater is currently running. This spa heats on demand
+        # whenever the water is below setpoint, independent of the filter
+        # cycles, so it is the fastest available signal that a setpoint we sent
+        # actually took effect.
         self.heating: bool = False
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._task: asyncio.Task | None = None
@@ -113,12 +114,14 @@ class SpaConnection:
         sibling endpoint on the same relay.
 
         This matters because the filter cycles are programmed against that clock
-        and it does not survive a power cut. When it comes back wrong FP1 drifts
-        away from the window this integration raises the setpoint in, and since
-        the heater only runs while the filter pump runs, the water quietly stops
-        heating. The clock cannot be read back -- the display multiplexes to the
-        water temperature at idle -- so it is re-asserted on a schedule rather
-        than checked and corrected.
+        and it does not survive a power cut, so after an outage the spa filters
+        at the wrong times. Heating is not affected -- this spa heats on demand
+        rather than only during filter cycles -- but filtration still drifts.
+
+        The clock cannot be read back -- the display multiplexes to the water
+        temperature at idle -- so it is re-asserted on a schedule rather than
+        checked and corrected. Writing the correct time to an already-correct
+        clock changes nothing, which is what makes that safe.
         """
         meridiem = "A" if when.hour < 12 else "P"
         await self.send(json.dumps({"time": f"{when:%I%M}{meridiem}"}))
