@@ -55,6 +55,12 @@ HEARTBEAT = 20
 SERVICE_SEND_RAW = "send_raw"
 ATTR_CODE = "code"
 
+# Setting the spa's clock. The spa is not necessarily in the same timezone as
+# the Home Assistant host -- this one runs three hours behind it -- so the zone
+# is a parameter rather than assumed.
+SERVICE_SET_TIME = "set_time"
+ATTR_TIMEZONE = "timezone"
+
 # Setting the temperature is not a WebSocket command — it is a form POST to a
 # sibling path of the socket URL. Visiting the app page first is what issues the
 # short-lived session cookie the POST needs.

@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
+from datetime import datetime
 
 import aiohttp
 
@@ -102,6 +103,25 @@ class SpaConnection:
             raise HomeAssistantError(f"Could not reach the spa: {err}") from err
 
         _LOGGER.info("Spa target temperature set to %s", temperature)
+
+    async def async_set_time(self, when: datetime) -> None:
+        """Set the spa's clock to ``when``.
+
+        The panel keeps a 12-hour clock and takes it as four digits plus an A or
+        P suffix -- 3:21pm is ``0321P`` -- wrapped in a JSON frame on the same
+        socket the buttons use. Captured from the iOS app, which reaches a
+        sibling endpoint on the same relay.
+
+        This matters because the filter cycles are programmed against that clock
+        and it does not survive a power cut. When it comes back wrong FP1 drifts
+        away from the window this integration raises the setpoint in, and since
+        the heater only runs while the filter pump runs, the water quietly stops
+        heating. The clock cannot be read back -- the display multiplexes to the
+        water temperature at idle -- so it is re-asserted on a schedule rather
+        than checked and corrected.
+        """
+        meridiem = "A" if when.hour < 12 else "P"
+        await self.send(json.dumps({"time": f"{when:%I%M}{meridiem}"}))
 
     @callback
     def add_listener(self, update_callback: Callable[[], None]) -> Callable[[], None]:

@@ -12,3 +12,24 @@ send_raw:
       example: "3"
       selector:
         text:
+
+set_time:
+  name: Set time
+  description: >-
+    Set the spa's clock to the current time. The filter cycles are programmed
+    against this clock and it does not survive a power cut, so re-asserting it
+    on a schedule is what keeps the filter window lined up with the setpoint.
+    The clock cannot be read back, so this always writes rather than checking
+    first -- which is harmless, since writing the correct time to an already
+    correct clock changes nothing.
+  fields:
+    timezone:
+      name: Timezone
+      description: >-
+        IANA timezone the spa is physically in. Defaults to Home Assistant's own
+        timezone, which is only right when the spa sits in the same zone as the
+        Home Assistant host.
+      required: false
+      example: America/Los_Angeles
+      selector:
+        text:
