@@ -54,17 +54,23 @@ is the setup it was built for — a spa on **America/Los_Angeles** whose Home
 Assistant runs on **America/Toronto**, three hours ahead. All times below are
 Home Assistant local.
 
-### Why the clock matters
+### How this spa actually heats
 
-**The heater only runs while the filter pump is running.** Raising the setpoint
-outside a filter cycle does nothing at all. So the setpoint has to be raised
-*during* a filter cycle, and the filter cycles are programmed on the topside
-panel against the panel's own clock.
+**The heater runs on demand, whenever the water is below setpoint** — it does
+*not* require a filter cycle. Observed directly: at 18:57 spa-local, outside
+both FP1 and FP2, a frame read flags `0x05` (heating + low pump) with the
+filtering bit clear, moments after the setpoint was raised above the water
+temperature.
 
-That clock has no battery. After a power cut it comes back wrong, the filter
-window drifts away from the window Home Assistant raises the setpoint in, and
-the water quietly stops heating — no error anywhere, just a tub that never gets
-warm. Hence the clock sync below.
+This corrects an earlier assumption, and it matters for cost rather than for
+correctness. Because the setpoint is live around the clock, **the floor value is
+a continuous running cost**: an 85 °F floor means the spa holds 85 °F all day,
+heating on demand, including through the whole 3pm–3am peak window. A low floor
+is the only thing keeping the heater off during peak.
+
+The clock still matters — the filter cycles run against it, and it has no
+battery, so it comes back wrong after a power cut — but heating no longer
+depends on it. Hence the clock sync below is about filtration, not heat.
 
 Panel-side programming assumed here: **FP1 12:00–15:00** and **FP2 23:00–23:45**,
 both spa-local.
@@ -83,7 +89,7 @@ The history-stats helper watches the `Heating` binary sensor, state `on`, type
 
 | Automation | Trigger | Action |
 | --- | --- | --- |
-| Hot tub temperature schedule | Hourly at :00 | 101 °F within 15:00–18:00, else 65 °F |
+| Hot tub temperature schedule | Hourly at :00 | 103 °F within 15:00–18:00, else an 85 °F floor |
 | Hot tub clock sync | Hourly at :30 | `set_time` with `America/Los_Angeles` |
 | Hot tub schedule hold — daily clear | 06:00 | Turns the hold off |
 | Hot tub heat window verification | 18:00 | Notifies if the heater never ran |
@@ -94,12 +100,12 @@ The history-stats helper watches the `Heating` binary sensor, state `on`, type
 | --- | --- | --- |
 | every :30 | — | Clock re-asserted, so drift costs at most an hour |
 | 06:00 | 03:00 | Peak ends; any manual hold is released |
-| 15:00 | 12:00 | FP1 starts **and** setpoint goes to 101 °F — they must coincide |
-| 15:00–18:00 | 12:00–15:00 | The only off-peak heating window |
-| 18:00 | 15:00 | Peak begins; setpoint drops to 65 °F |
+| 15:00 | 12:00 | Setpoint goes to 103 °F; FP1 also starts |
+| 15:00–18:00 | 12:00–15:00 | The push to temperature, entirely off-peak |
+| 18:00 | 15:00 | Peak begins; setpoint drops to the 85 °F floor |
 | 18:00 | 15:00 | Verification: alert if the heater never fired |
-| 23:00 | 20:00 | — |
-| 02:00 | 23:00 | FP2 runs, but it's inside peak, so the low setpoint keeps the heater off |
+| 18:00–06:00 | 15:00–03:00 | Peak. The spa still holds 85 °F on demand — this is the floor's cost |
+| 02:00 | 23:00 | FP2 filters; heat here depends on the floor, not on FP2 |
 
 ### Design notes
 
@@ -112,29 +118,42 @@ multiplexes to water temperature at idle. Writing the correct time to an
 already-correct clock changes nothing, which makes blind re-assertion safe and
 removes the need for a verify-then-fix path that the hardware can't support.
 
-**Verification is by consequence.** Since the clock is unreadable, the heat
-window sensor checks the thing the clock is supposed to produce — heater
-runtime. Zero runtime across a whole window means the cycle isn't overlapping.
-It uses `history_stats` rather than a `for:` duration because `for:` clocks
-reset on every restart and every `unavailable` blip.
+**Verification is by consequence.** Nothing raises an error when heating fails:
+the schedule reports success as long as the POST returns 200, which says nothing
+about whether the water moved. The heat window sensor measures heater runtime
+instead — zero runtime across a whole window, with the water below target, means
+the spa isn't acting on the setpoint at all. It uses `history_stats` rather than
+a `for:` duration because `for:` clocks reset on every restart and every
+`unavailable` blip.
 
 **The hold expires.** An open-ended override is a rental hazard — a guest flips
 it, leaves, and the tub heats through peak indefinitely. It clears at the end of
 peak, so it covers one night at most.
 
-## Known limitation: the window is too short to reach 101 °F
+## The floor is the cost knob
 
-A spa heater moves water roughly 5 °F/hour. A three-hour window from a 65 °F
-floor buys about 17 °F, so the tub arrives in the low 80s, not at 101 °F. FP1 is
-also the *only* off-peak filter cycle — FP2 sits inside peak — so there is no
-second heating opportunity in the day.
+A spa heater moves water roughly 5 °F/hour, so a three-hour window lifts it
+about 15 °F. That sets how far apart the floor and the target can usefully be:
+from an 85 °F floor, three hours reaches roughly 100 °F against a 103 °F target,
+which is close enough that the last stretch is deadband. From a 65 °F floor the
+same window lands in the low 80s.
 
-Two ways to close the gap, both panel-side or one-line:
+The catch is that the floor is held **continuously**, on demand, peak rates
+included. So the two settings trade directly against each other:
 
-- **Raise the floor** from 65 °F to 85–90 °F. The heater still never runs during
-  peak; each window just starts with less ground to make up.
-- **Start FP1 earlier.** Off-peak runs until 15:00 spa-local, so a 09:00–15:00
-  FP1 gives six hours of heating at no peak cost.
+- **Higher floor** — the tub is usable at any hour and the afternoon window
+  reaches temperature, paid for with twelve hours a day of peak-rate maintenance.
+- **Lower floor** — no peak heating at all, but the tub is cold outside the
+  afternoon window and the window can't close the gap.
+
+A third shape is available if the bill matters more than round-the-clock
+readiness: hold a warm floor only during off-peak (06:00–18:00 HA) and drop to a
+cold one for peak (18:00–06:00 HA). That heats on cheap hours only, and the tub
+coasts down overnight from the afternoon peak instead of being held warm.
+
+**Starting FP1 earlier is no longer a lever.** It would have been when heating
+was thought to require a filter cycle; since the heater runs on demand, the
+filter schedule doesn't gate heat.
 
 The verification automation will tell you whether heat is happening at all; it
 deliberately does not alarm on merely falling short of target.

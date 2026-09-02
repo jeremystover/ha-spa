@@ -84,6 +84,34 @@ Byte 5: `0x10` = light.
 These are **bit tests, not values**. Heating alongside low jets is `0x05`, so an
 equality check against `0x04` misses it — an actual bug that was fixed here.
 
+### The heater runs on demand
+
+Worth stating plainly because the opposite was assumed for a while: **heating
+does not require a filter cycle.** A frame captured at 18:57 spa-local, outside
+both FP1 (12:00–15:00) and FP2 (23:00–23:45), read:
+
+```
+007d3fce0500
+         └─ 0x05 = HEATING | JETS_LO, filtering bit clear
+```
+
+taken moments after the setpoint was raised above the water temperature. So the
+setpoint is live around the clock, and the low setpoint — not the filter
+schedule — is what keeps the heater off during expensive hours.
+
+**Unresolved:** the flag has also been observed set with the water *above*
+setpoint (water 91 °F, setpoint 85 °F). It may cover a heat cycle including pump
+overrun rather than the element alone, or the setpoint may not have landed.
+Read it as "heating activity", not "element energized", until someone pins it
+down.
+
+### A transient worth recognising
+
+While a setpoint write is in flight the edit bit (`0x20`) is set and the digits
+can briefly read `0x7F` — every segment lit — which decodes as `8` and yields a
+plausible but wrong number. Frames captured mid-write are not readings. Wait for
+the edit bit to clear.
+
 ## Setting the temperature
 
 Not a socket command. An HTML form POST, and the setter is **absolute**, not

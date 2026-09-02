@@ -26,14 +26,21 @@ async def async_setup_entry(
 
 
 class SpaHeatingBinarySensor(BinarySensorEntity):
-    """Whether the spa's heater element is currently firing.
+    """Whether the spa's heater is currently running.
 
-    Worth having beyond simple curiosity: the spa only heats while its filter
-    pump is running, and the filter cycle is programmed on the topside panel
-    against the panel's own clock. That clock is not readable over this
-    connection and drifts whenever the spa loses power. This entity is how Home
-    Assistant can tell — by consequence rather than by reading a clock — that a
-    filter cycle really did overlap the setpoint it asked for.
+    Worth having because nothing else reports whether a setpoint actually did
+    anything: the setpoint POST returns 200 whether or not the water moves, and
+    the water temperature takes hours to show it. This says so within a minute.
+
+    On this spa the heater runs on DEMAND, whenever the water is below setpoint
+    -- a frame captured outside both programmed filter cycles read flags 0x05,
+    heating plus low pump, with the filtering bit clear. So heater runtime
+    tracks the setpoint, not the filter schedule, and a raised setpoint that
+    produces no runtime at all means the spa is not acting on it.
+
+    One caveat, unresolved: the flag has been seen set with the water above
+    setpoint. It may cover a heat cycle including pump overrun rather than the
+    element alone. Treat it as "heating activity", not "element energized".
     """
 
     _attr_has_entity_name = True
