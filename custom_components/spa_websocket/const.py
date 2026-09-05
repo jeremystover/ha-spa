@@ -63,6 +63,21 @@ STALENESS_TICK_SECONDS = 60
 # no live link, which is the state that produces silent command loss.
 KEY_RELAY_STATUS = "stsR"
 
+# The session cookie the app page issues lasts about an hour. Fetching that page
+# before every single write minted a brand new session roughly twenty-four times
+# a day on one token -- far more than a browser would ever do, and the leading
+# suspect for the token going dead on its own. Reuse the cookie until it is close
+# to expiring instead.
+SESSION_MAX_AGE_SECONDS = 2700
+
+# How stale an unchanged setpoint may get before it is re-sent. The hourly
+# schedule exists so a lost write costs an hour rather than a day, but the value
+# is genuinely different only twice a day -- the other twenty-two writes restate
+# what the spa already has. Re-asserting on this cadence keeps the recovery
+# property while dropping most of the traffic. It also still corrects a setpoint
+# changed at the panel, just not within the hour.
+SETPOINT_REASSERT_SECONDS = 21600
+
 # WebSocket ping interval. The relay closes idle connections after ~60s, which
 # left the socket down for part of every minute and dropped commands sent in
 # the gap.

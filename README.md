@@ -90,7 +90,7 @@ The history-stats helper watches the `Heating` binary sensor, state `on`, type
 | Automation | Trigger | Action |
 | --- | --- | --- |
 | Hot tub temperature schedule | Hourly at :00 | 103 °F within 15:00–18:00, else an 85 °F floor |
-| Hot tub clock sync | Hourly at :30 | `set_time` with `America/Los_Angeles` |
+| Hot tub clock sync | Daily at 07:00 | `set_time` with `America/Los_Angeles` |
 | Hot tub schedule hold — daily clear | 06:00 | Turns the hold off |
 | Hot tub heat window verification | 18:00 | Notifies if the heater never ran |
 
@@ -98,8 +98,8 @@ The history-stats helper watches the `Heating` binary sensor, state `on`, type
 
 | HA time | Spa time | What |
 | --- | --- | --- |
-| every :30 | — | Clock re-asserted, so drift costs at most an hour |
 | 06:00 | 03:00 | Peak ends; any manual hold is released |
+| 07:00 | 04:00 | Clock re-asserted, off-peak and before the filter cycle |
 | 15:00 | 12:00 | Setpoint goes to 103 °F; FP1 also starts |
 | 15:00–18:00 | 12:00–15:00 | The push to temperature, entirely off-peak |
 | 18:00 | 15:00 | Peak begins; setpoint drops to the 85 °F floor |
@@ -112,6 +112,16 @@ The history-stats helper watches the `Heating` binary sensor, state `on`, type
 **Hourly, not once.** Every enforcement re-asserts rather than firing on a
 single edge, so a missed run — spa offline, expired relay session, HA restart —
 costs one hour instead of a whole day.
+
+**But the wire traffic is deliberately frugal.** The token authorising all of
+this went dead on its own about a day after the integration started fetching the
+app page every hour, each fetch minting a fresh session, while nothing was
+changed at the spa. Circumstantial, but twenty-four new sessions a day on one
+token is nothing a browser would produce. So an unchanged setpoint is not
+re-sent until it goes stale, the session cookie is reused rather than re-minted,
+and the clock is set once a day rather than forty-eight times. One simulated day
+of the schedule now costs 10 requests instead of 48. A setpoint changed at the
+panel is still corrected, just within six hours rather than within the hour.
 
 **The clock is written, never checked.** It can't be read back: the display
 multiplexes to water temperature at idle. Writing the correct time to an
