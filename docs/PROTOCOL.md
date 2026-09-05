@@ -202,6 +202,32 @@ def websocket_message(flow: http.HTTPFlow):
 Remove the proxy setting and delete the CA certificate afterwards — a trusted
 root left installed is a standing risk.
 
+## The token goes stale, and it fails silently
+
+The token in `/spa/<token>/` is what authorises this integration. It is not
+permanent — re-pairing the module or regenerating the web link rotates it.
+
+When it dies, nothing says so. Observed over two days in September 2026:
+
+| | |
+| --- | --- |
+| `GET /app` | 200, and the control page still renders |
+| The rendered page | no temperature, buttons inert |
+| `POST /settemp` | 200, setpoint silently discarded |
+| WebSocket `/wsb` | connects, then sends only `{"stsR": 0}` |
+| The iOS app | **unaffected** — it uses `/wsa/...` with its own credential |
+
+`stsR: 0` on the browser endpoint means the session is not authorised. It does
+*not* mean the spa is offline; the spa was working normally by hand throughout,
+and the app never missed a beat.
+
+The tell is that the **web UI at the same token fails identically**. If the page
+loads but shows no temperature and its buttons do nothing, the token is dead and
+no amount of restarting Home Assistant will help. Get a fresh URL from the app
+and use the integration's **reconfigure** step — not delete-and-re-add, which
+mints new entity IDs and breaks every automation silently (see
+`config_flow.py`).
+
 ## Open questions
 
 - Button code `4` is labelled **Filter** here; the web app calls it `system`.
