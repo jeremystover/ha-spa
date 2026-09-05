@@ -77,6 +77,24 @@ def rotate(segments: int) -> int:
     return rotated
 
 
+def plausible(temperature: int, unit: str) -> bool:
+    """Return whether a decoded reading could be spa water at all.
+
+    The decoder happily turns any three well-formed glyphs into a number, and
+    the panel shows plenty that are not temperatures -- menu items, codes, and
+    mid-refresh artifacts where every segment lights. Real readings observed in
+    the field include 19, 194, 195, 592, 599 and 992, all published as water
+    temperature and all recorded by the history the verification check reads.
+
+    The bounds are deliberately wider than the spa's own 45-104F setpoint range:
+    water really can sit below the minimum setpoint, and the controller has its
+    own ideas below 40F. This only rejects what cannot be water in a spa.
+    """
+    if unit == "F":
+        return 40 <= temperature <= 115
+    return 4 <= temperature <= 46
+
+
 def decode_temperature(dsp: str) -> tuple[int, str] | None:
     """Return ``(temperature, unit)`` from a ``dsp`` hex string, or None.
 
@@ -122,4 +140,7 @@ def decode_temperature(dsp: str) -> tuple[int, str] | None:
     elif (hundreds := SEGMENTS_TO_DIGIT.get(hundreds)) is None:
         return None
 
-    return hundreds * 100 + tens * 10 + ones, unit
+    temperature = hundreds * 100 + tens * 10 + ones
+    if not plausible(temperature, unit):
+        return None
+    return temperature, unit
