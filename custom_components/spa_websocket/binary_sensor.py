@@ -63,6 +63,11 @@ class SpaHeatingBinarySensor(BinarySensorEntity):
         self.async_on_remove(self._connection.add_listener(self.async_write_ha_state))
 
     @property
+    def available(self) -> bool:
+        """Return False while the spa is not reporting."""
+        return self._connection.available
+
+    @property
     def is_on(self) -> bool:
         """Return True while the heater is firing."""
         return self._connection.heating

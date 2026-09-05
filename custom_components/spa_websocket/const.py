@@ -46,6 +46,23 @@ DSP_FLAG_TO_STATE = (
 # How long to wait before reconnecting after the socket drops.
 RECONNECT_DELAY = 5
 
+# The spa pushes a display frame roughly once a second. If those stop, nothing
+# errors: the relay stays reachable, keeps the socket open, and keeps answering
+# HTTP with 200 -- it simply has nothing from the spa to forward. Every reading
+# then goes quietly stale and every command is accepted and dropped. Treat a gap
+# this long as the spa being offline. Generous enough not to flap on a
+# reconnect, short enough to catch it within one enforcement cycle.
+STALE_AFTER_SECONDS = 300
+
+# How often to re-evaluate staleness. Availability is time-based, so without a
+# tick nothing recomputes it once frames stop -- the very situation it exists to
+# detect.
+STALENESS_TICK_SECONDS = 60
+
+# The relay reports its own link to the spa in a "stsR" frame. Zero means it has
+# no live link, which is the state that produces silent command loss.
+KEY_RELAY_STATUS = "stsR"
+
 # WebSocket ping interval. The relay closes idle connections after ~60s, which
 # left the socket down for part of every minute and dropped commands sent in
 # the gap.

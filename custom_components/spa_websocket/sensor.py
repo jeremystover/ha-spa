@@ -54,6 +54,11 @@ class SpaJetsSensor(SensorEntity):
         self.async_on_remove(self._connection.add_listener(self.async_write_ha_state))
 
     @property
+    def available(self) -> bool:
+        """Return False while the spa is not reporting."""
+        return self._connection.available
+
+    @property
     def native_value(self) -> str:
         """Return the current jets state name."""
         return STATE_NAMES.get(self._connection.jets_state, STATE_NAMES[STATE_OFF])
@@ -86,6 +91,17 @@ class SpaTemperatureSensor(SensorEntity):
     async def async_added_to_hass(self) -> None:
         """Subscribe to connection updates."""
         self.async_on_remove(self._connection.add_listener(self.async_write_ha_state))
+
+    @property
+    def available(self) -> bool:
+        """Return False while the spa is not reporting.
+
+        Without this the sensor holds its last decoded reading indefinitely, so
+        a dead link reads as a plausible water temperature rather than as no
+        data. That reading also gates the heat-window verification, which then
+        silently passes on stale numbers.
+        """
+        return self._connection.available
 
     @property
     def native_value(self) -> int | None:

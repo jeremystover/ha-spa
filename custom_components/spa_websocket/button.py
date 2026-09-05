@@ -53,6 +53,11 @@ class SpaButton(ButtonEntity):
             manufacturer="Spa",
         )
 
+    @property
+    def available(self) -> bool:
+        """Return False while the spa is not reporting."""
+        return self._connection.available
+
     async def async_press(self) -> None:
         """Send the command code to the spa."""
         await self._connection.send(self._code)
