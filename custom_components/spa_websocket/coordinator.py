@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import aiohttp
 
@@ -22,15 +22,20 @@ from homeassistant.helpers.aiohttp_client import (
     async_create_clientsession,
     async_get_clientsession,
 )
+from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DSP_FLAG_TO_STATE,
     FLAG_EDIT,
     FLAG_HEATING,
     HEARTBEAT,
+    KEY_RELAY_STATUS,
     PATH_APP,
     PATH_SETTEMP,
     RECONNECT_DELAY,
+    STALE_AFTER_SECONDS,
+    STALENESS_TICK_SECONDS,
     STATE_NAMES,
     STATE_OFF,
 )
@@ -60,13 +65,40 @@ class SpaConnection:
         # cycles, so it is the fastest available signal that a setpoint we sent
         # actually took effect.
         self.heating: bool = False
+        # When the last display frame arrived, and whether the relay says it has
+        # a live link to the spa. Both feed `available` -- see that property for
+        # why a dead link is otherwise completely silent.
+        self.last_frame_at: datetime | None = None
+        self.relay_linked: bool = True
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._task: asyncio.Task | None = None
+        self._unsub_tick: Callable[[], None] | None = None
         self._closing = False
         self._listeners: list[Callable[[], None]] = []
         # Its own cookie jar: the settemp POST is authenticated by a session
         # cookie that must not leak into Home Assistant's shared session.
         self._http = async_create_clientsession(hass)
+
+    @property
+    def available(self) -> bool:
+        """Whether the spa is actually reporting right now.
+
+        Worth the machinery because the failure this catches is invisible
+        otherwise. When the spa's WiFi module drops off the cloud relay, the
+        relay stays up: the WebSocket connects, HTTP returns 200, and no
+        exception is raised anywhere. It just has nothing from the spa. Readings
+        freeze at their last value and setpoints are accepted and discarded.
+
+        Observed in the field: the setpoint was written on schedule for two days
+        while the water cooled from 99F to 83F, with every automation reporting
+        success and not one error in the log.
+        """
+        if not self.relay_linked:
+            return False
+        if self.last_frame_at is None:
+            return False
+        age = (dt_util.utcnow() - self.last_frame_at).total_seconds()
+        return age < STALE_AFTER_SECONDS
 
     @property
     def _base_url(self) -> str:
@@ -84,6 +116,14 @@ class SpaConnection:
         by a session cookie that the app page issues and that expires after about
         an hour, so the cookie is minted fresh rather than stored.
         """
+        if not self.available:
+            raise HomeAssistantError(
+                f"Spa is not reporting, so setpoint {temperature} was not sent. "
+                "The relay accepts and acknowledges commands even when the spa "
+                "is offline, so sending anyway would look like success and "
+                "change nothing."
+            )
+
         base = self._base_url
         payload = {
             "flip-scale": "0",
@@ -147,10 +187,21 @@ class SpaConnection:
         self._task = self.hass.async_create_background_task(
             self._run(), name=f"spa_websocket {self.url}"
         )
+        # Availability is a function of elapsed time, so once frames stop there
+        # is no incoming event left to recompute it. Without this tick the
+        # entities would sit on stale values forever, which is the exact bug.
+        self._unsub_tick = async_track_time_interval(
+            self.hass,
+            self._async_check_staleness,
+            timedelta(seconds=STALENESS_TICK_SECONDS),
+        )
 
     async def stop(self) -> None:
         """Stop the connection loop and close the socket."""
         self._closing = True
+        if self._unsub_tick is not None:
+            self._unsub_tick()
+            self._unsub_tick = None
         if self._ws is not None:
             await self._ws.close()
         if self._task is not None:
@@ -200,6 +251,11 @@ class SpaConnection:
             await asyncio.sleep(RECONNECT_DELAY)
 
     @callback
+    def _async_check_staleness(self, _now: datetime) -> None:
+        """Re-publish entity state so availability reflects elapsed time."""
+        self._notify_listeners()
+
+    @callback
     def _handle_message(self, raw: str | bytes) -> None:
         """Parse an incoming message and update the jets state."""
         if isinstance(raw, (bytes, bytearray)):
@@ -220,8 +276,25 @@ class SpaConnection:
 
         dsp = parsed.get("dsp") if isinstance(parsed, dict) else None
 
+        # The relay volunteers its own link state. A zero here is the relay
+        # saying it has nothing from the spa, which is exactly when it would
+        # otherwise go on silently accepting commands.
+        if isinstance(parsed, dict) and KEY_RELAY_STATUS in parsed:
+            linked = bool(parsed[KEY_RELAY_STATUS])
+            if linked != self.relay_linked:
+                _LOGGER.warning(
+                    "Spa relay reports the spa is %s",
+                    "reachable" if linked else "OFFLINE — commands will be lost",
+                )
+                self.relay_linked = linked
+                changed = True
+
         # Ignore all-zero / too-short frames, matching the original plugin.
         if isinstance(dsp, str) and len(dsp) >= 12 and dsp.strip("0") != "":
+            # Only a real display frame counts as the spa reporting. The relay
+            # keeps talking to us after the spa is gone, so its own chatter must
+            # not be mistaken for liveness.
+            self.last_frame_at = dt_util.utcnow()
             flags = int(dsp[8:10], 16)
 
             new_state = STATE_OFF

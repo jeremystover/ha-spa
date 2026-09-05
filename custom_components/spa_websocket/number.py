@@ -52,6 +52,11 @@ class SpaTargetTemperature(NumberEntity):
         self._value: float | None = None
 
     @property
+    def available(self) -> bool:
+        """Return False while the spa is not reporting."""
+        return self._connection.available
+
+    @property
     def native_value(self) -> float | None:
         """Return the last setpoint written from Home Assistant."""
         return self._value
