@@ -58,7 +58,15 @@ class SpaTargetTemperature(NumberEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Return the last setpoint written from Home Assistant."""
+        """Return the spa's setpoint, preferring what the spa itself reports.
+
+        Falls back to the last value written from Home Assistant, which is all
+        that was available before the readback existed — and which is exactly
+        the assumption that let two days of discarded setpoints look like
+        success.
+        """
+        if self._connection.reported_setpoint is not None:
+            return self._connection.reported_setpoint
         return self._value
 
     async def async_set_native_value(self, value: float) -> None:

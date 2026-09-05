@@ -1,4 +1,9 @@
-"""Drive SpaConnection's availability logic with the HA runtime stubbed out."""
+"""Drive the spa coordinator with the Home Assistant runtime stubbed out.
+
+Covers availability and the relay link, a full day of scheduled traffic, the
+setpoint readback, and the decoder's plausibility bound. No dependencies --
+run it with plain python3.
+"""
 
 import pathlib
 import sys
@@ -89,8 +94,20 @@ check("available", c2.available, False)
 import asyncio  # noqa: E402
 
 
+APP_PAGE = (
+    '<form method="post" action="https://h/spa/TOKEN/settemp">'
+    '<input type="number" name="void" id="slider-1" min="45" max="104" '
+    'step="1" value="{sp}">'
+    '<input type="hidden" name="temp" id="slider-F" value="{sp}">'
+    "</form>"
+)
+
+
 class FakeResp:
     status = 200
+
+    def __init__(self, body=""):
+        self._body = body
 
     async def __aenter__(self):
         return self
@@ -98,21 +115,28 @@ class FakeResp:
     async def __aexit__(self, *exc):
         return False
 
+    async def text(self):
+        return self._body
+
 
 class FakeHTTP:
-    """Counts what actually goes over the wire."""
+    """Counts what actually goes over the wire, and echoes a page back."""
 
-    def __init__(self):
+    def __init__(self, echo=True):
         self.gets = 0
         self.posts = 0
+        self.echo = echo
+        self.last_sent = None
 
-    async def get(self, url):
+    def get(self, url):
         self.gets += 1
-        return FakeResp()
+        sp = self.last_sent if self.last_sent is not None else 85
+        return FakeResp(APP_PAGE.format(sp=sp) if self.echo else "")
 
     def post(self, url, data=None):
         self.posts += 1
-        return FakeResp()
+        self.last_sent = int(data["temp"])
+        return FakeResp(APP_PAGE.format(sp=self.last_sent) if self.echo else "")
 
 
 def simulate_day():
@@ -149,6 +173,54 @@ check("remembered setpoint cleared", conn._setpoint, None)
 conn._handle_message(FRAME)
 asyncio.run(conn.async_set_temperature(85))
 check("re-asserted after recovery", conn._setpoint, 85)
+
+
+
+# --- setpoint readback -------------------------------------------------------
+from spa_websocket.coordinator import parse_setpoint  # noqa: E402
+from spa_websocket.decode import decode_temperature, plausible  # noqa: E402
+
+print("\n=== setpoint readback off the app page ===")
+check("parses the rendered form", parse_setpoint(APP_PAGE.format(sp=103)), 103)
+check("attribute order independent",
+      parse_setpoint('<input value="99" name="void" type="number">'), 99)
+check("no form -> None", parse_setpoint("<html>nothing here</html>"), None)
+
+NOW[0] = datetime(2026, 9, 7, 15, 0, tzinfo=timezone.utc)
+c3 = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
+c3._http = FakeHTTP()
+c3._handle_message(FRAME)
+asyncio.run(c3.async_set_temperature(103))
+check("reports the spa's value, not ours", c3.reported_setpoint, 103)
+
+print("\na page that does not echo must not invent a reading:")
+c4 = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
+c4._http = FakeHTTP(echo=False)
+c4._handle_message(FRAME)
+asyncio.run(c4.async_set_temperature(103))
+check("reported_setpoint stays None", c4.reported_setpoint, None)
+
+print("\nan outage clears the readback too (it is stale, not truth):")
+NOW[0] += timedelta(seconds=STALE_AFTER_SECONDS + 1)
+c3._async_check_staleness(NOW[0])
+check("cleared", c3.reported_setpoint, None)
+
+
+# --- decoder plausibility ----------------------------------------------------
+print("\n=== decoder rejects what cannot be spa water ===")
+for value, unit, want in [
+    (92, "F", True), (40, "F", True), (115, "F", True),
+    (19, "F", False), (194, "F", False), (195, "F", False),
+    (592, "F", False), (599, "F", False), (992, "F", False),
+    (38, "C", True), (46, "C", True), (99, "C", False),
+]:
+    check(f"{value}{unit} plausible", plausible(value, unit), want)
+
+print("\nreal frames still decode:")
+check("upright 92F", decode_temperature("f15b6f000500"), (92, "F"))
+check("flipped 96F", decode_temperature("007d6fce1400"), (96, "F"))
+check("flipped 91F", decode_temperature("007d30ce0500"), (91, "F"))
+check("ECon is not a temperature", decode_temperature("4f0f63620000"), None)
 
 print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
 sys.exit(1 if fails else 0)

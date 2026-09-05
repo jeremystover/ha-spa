@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
@@ -44,6 +45,27 @@ from .const import (
 from .decode import decode_temperature
 
 _LOGGER = logging.getLogger(__name__)
+
+# The app page carries the spa's live setpoint in the form it renders:
+#   <input type="number" name="void" ... value="85">
+# Matching the whole tag first keeps this indifferent to attribute order.
+_SETPOINT_INPUT = re.compile(r"<input[^>]*name=\"void\"[^>]*>", re.IGNORECASE)
+_SETPOINT_VALUE = re.compile(r"value=\"(\d{1,3})\"", re.IGNORECASE)
+
+
+def parse_setpoint(html: str) -> int | None:
+    """Return the setpoint the spa reports on its app page, or None.
+
+    This is the only way to learn what the spa actually has, as opposed to what
+    was last sent to it. The distinction is not academic: a relay that has lost
+    the spa answers every write with 200, so without a readback a setpoint that
+    went nowhere is indistinguishable from one that landed.
+    """
+    if (tag := _SETPOINT_INPUT.search(html)) is None:
+        return None
+    if (value := _SETPOINT_VALUE.search(tag.group(0))) is None:
+        return None
+    return int(value.group(1))
 
 
 class SpaConnection:
@@ -79,6 +101,9 @@ class SpaConnection:
         self._setpoint: int | None = None
         self._setpoint_at: datetime | None = None
         self._session_at: datetime | None = None
+        # What the spa itself says its setpoint is, read back off the app page.
+        # Distinct from _setpoint, which is only what was last sent.
+        self.reported_setpoint: int | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._task: asyncio.Task | None = None
         self._unsub_tick: Callable[[], None] | None = None
@@ -165,7 +190,8 @@ class SpaConnection:
                 self._session_at is None
                 or (now - self._session_at).total_seconds() >= SESSION_MAX_AGE_SECONDS
             ):
-                await self._http.get(f"{base}/{PATH_APP}")
+                async with self._http.get(f"{base}/{PATH_APP}") as page:
+                    self._read_setpoint(await page.text())
                 self._session_at = now
             async with self._http.post(
                 f"{base}/{PATH_SETTEMP}", data=payload
@@ -174,12 +200,38 @@ class SpaConnection:
                     raise HomeAssistantError(
                         f"Spa rejected setpoint {temperature}: HTTP {resp.status}"
                     )
+                # The form POST renders the page back, so the spa's own view of
+                # the setpoint arrives here for free.
+                self._read_setpoint(await resp.text(), expected=temperature)
         except aiohttp.ClientError as err:
             raise HomeAssistantError(f"Could not reach the spa: {err}") from err
 
         self._setpoint = temperature
         self._setpoint_at = now
         _LOGGER.info("Spa target temperature set to %s", temperature)
+
+    @callback
+    def _read_setpoint(self, html: str, expected: int | None = None) -> None:
+        """Record the setpoint the spa reports, and flag it if it disagrees.
+
+        Deliberately does not raise on a mismatch. Whether this endpoint echoes
+        the new value or the pre-write one has not been established against the
+        hardware, and guessing wrong would fail every legitimate write. A warning
+        plus a reported value that is the spa's rather than ours is enough to see
+        the problem; tighten it once the echo semantics are confirmed.
+        """
+        reported = parse_setpoint(html)
+        if reported is None:
+            return
+        self.reported_setpoint = reported
+        if expected is not None and reported != expected:
+            _LOGGER.warning(
+                "Spa reports setpoint %s after being sent %s — the write may not "
+                "have landed",
+                reported,
+                expected,
+            )
+        self._notify_listeners()
 
     async def async_set_time(self, when: datetime) -> None:
         """Set the spa's clock to ``when``.
@@ -297,6 +349,7 @@ class SpaConnection:
             self._setpoint = None
             self._setpoint_at = None
             self._session_at = None
+            self.reported_setpoint = None
         self._notify_listeners()
 
     @callback
