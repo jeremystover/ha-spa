@@ -83,5 +83,72 @@ c2 = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
 c2._handle_message('{"stsR":0}')
 check("available", c2.available, False)
 
+
+
+# --- traffic: a full simulated day of the hourly schedule --------------------
+import asyncio  # noqa: E402
+
+
+class FakeResp:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeHTTP:
+    """Counts what actually goes over the wire."""
+
+    def __init__(self):
+        self.gets = 0
+        self.posts = 0
+
+    async def get(self, url):
+        self.gets += 1
+        return FakeResp()
+
+    def post(self, url, data=None):
+        self.posts += 1
+        return FakeResp()
+
+
+def simulate_day():
+    """Run 24 hourly enforcements exactly as the schedule automation does."""
+    conn = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
+    http = FakeHTTP()
+    conn._http = http
+    for hour in range(24):
+        NOW[0] = datetime(2026, 9, 6, hour, 0, tzinfo=timezone.utc)
+        conn._handle_message(FRAME)  # the spa keeps reporting all day
+        want = 103 if hour in (15, 16, 17) else 85
+        asyncio.run(conn.async_set_temperature(want))
+    return http, conn
+
+
+print("\n=== one day of the hourly schedule ===")
+NOW[0] = datetime(2026, 9, 6, 0, 0, tzinfo=timezone.utc)
+http, conn = simulate_day()
+before = 24 * 2  # every hour did a GET /app plus a POST
+after = http.gets + http.posts
+print(f"  GET /app (session mints): {http.gets}   was 24")
+print(f"  POST settemp:             {http.posts}   was 24")
+print(f"  total requests:           {after}   was {before}"
+      f"   ({100 - round(100 * after / before)}% fewer)")
+check("setpoint still ends correct", conn._setpoint, 85)
+check("session mints under 24", http.gets < 24, True)
+check("both schedule transitions sent", http.posts >= 2, True)
+
+print("\nan outage must clear the dedupe so recovery re-asserts:")
+NOW[0] += timedelta(seconds=STALE_AFTER_SECONDS + 1)
+conn._async_check_staleness(NOW[0])
+check("available", conn.available, False)
+check("remembered setpoint cleared", conn._setpoint, None)
+conn._handle_message(FRAME)
+asyncio.run(conn.async_set_temperature(85))
+check("re-asserted after recovery", conn._setpoint, 85)
+
 print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
 sys.exit(1 if fails else 0)

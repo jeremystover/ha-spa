@@ -34,6 +34,8 @@ from .const import (
     PATH_APP,
     PATH_SETTEMP,
     RECONNECT_DELAY,
+    SESSION_MAX_AGE_SECONDS,
+    SETPOINT_REASSERT_SECONDS,
     STALE_AFTER_SECONDS,
     STALENESS_TICK_SECONDS,
     STATE_NAMES,
@@ -70,6 +72,13 @@ class SpaConnection:
         # why a dead link is otherwise completely silent.
         self.last_frame_at: datetime | None = None
         self.relay_linked: bool = True
+        # What was last written and when, and when the session cookie was last
+        # minted. Both exist to keep traffic down -- see async_set_temperature --
+        # and both are cleared whenever the spa stops reporting, so a recovery
+        # re-asserts rather than trusting state from before the gap.
+        self._setpoint: int | None = None
+        self._setpoint_at: datetime | None = None
+        self._session_at: datetime | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._task: asyncio.Task | None = None
         self._unsub_tick: Callable[[], None] | None = None
@@ -113,8 +122,21 @@ class SpaConnection:
         """Set the spa's target temperature.
 
         Temperature is not a WebSocket command. It is a form POST, authenticated
-        by a session cookie that the app page issues and that expires after about
-        an hour, so the cookie is minted fresh rather than stored.
+        by a session cookie that the app page issues and that lasts about an
+        hour.
+
+        Deliberately frugal, because the traffic itself appears to be harmful.
+        The token authorising all of this went dead on its own about a day after
+        this integration began fetching the app page every hour -- each fetch
+        minting a fresh session -- while the owner changed nothing. That is
+        circumstantial, but twenty-four new sessions a day on one token is
+        nothing a browser would ever produce, and the cost of being wrong here is
+        only a slightly later correction.
+
+        So: an unchanged setpoint is not re-sent until it goes stale, and the
+        cookie is reused rather than re-minted. Both counters reset whenever the
+        spa stops reporting, so recovery from an outage still re-asserts
+        everything from scratch.
         """
         if not self.available:
             raise HomeAssistantError(
@@ -124,6 +146,15 @@ class SpaConnection:
                 "change nothing."
             )
 
+        now = dt_util.utcnow()
+        if (
+            self._setpoint == temperature
+            and self._setpoint_at is not None
+            and (now - self._setpoint_at).total_seconds() < SETPOINT_REASSERT_SECONDS
+        ):
+            _LOGGER.debug("Spa setpoint already %s, not re-sending", temperature)
+            return
+
         base = self._base_url
         payload = {
             "flip-scale": "0",
@@ -132,7 +163,12 @@ class SpaConnection:
         }
 
         try:
-            await self._http.get(f"{base}/{PATH_APP}")
+            if (
+                self._session_at is None
+                or (now - self._session_at).total_seconds() >= SESSION_MAX_AGE_SECONDS
+            ):
+                await self._http.get(f"{base}/{PATH_APP}")
+                self._session_at = now
             async with self._http.post(
                 f"{base}/{PATH_SETTEMP}", data=payload
             ) as resp:
@@ -143,6 +179,8 @@ class SpaConnection:
         except aiohttp.ClientError as err:
             raise HomeAssistantError(f"Could not reach the spa: {err}") from err
 
+        self._setpoint = temperature
+        self._setpoint_at = now
         _LOGGER.info("Spa target temperature set to %s", temperature)
 
     async def async_set_time(self, when: datetime) -> None:
@@ -253,6 +291,14 @@ class SpaConnection:
     @callback
     def _async_check_staleness(self, _now: datetime) -> None:
         """Re-publish entity state so availability reflects elapsed time."""
+        if not self.available:
+            # Nothing learned before the gap can be trusted across it: the spa
+            # may have been power-cycled, or writes may have been landing
+            # nowhere. Forget both so recovery re-asserts the setpoint and mints
+            # a fresh session instead of assuming either survived.
+            self._setpoint = None
+            self._setpoint_at = None
+            self._session_at = None
         self._notify_listeners()
 
     @callback
