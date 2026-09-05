@@ -125,15 +125,13 @@ class SpaConnection:
         by a session cookie that the app page issues and that lasts about an
         hour.
 
-        Deliberately frugal, because the traffic itself appears to be harmful.
-        The token authorising all of this went dead on its own about a day after
-        this integration began fetching the app page every hour -- each fetch
-        minting a fresh session -- while the owner changed nothing. That is
-        circumstantial, but twenty-four new sessions a day on one token is
-        nothing a browser would ever produce, and the cost of being wrong here is
-        only a slightly later correction.
+        Deliberately frugal. Re-asserting hourly does not require re-sending
+        hourly: the value genuinely differs twice a day, and the rest restate
+        what the spa already has. Fetching the app page before each POST also
+        minted a fresh session every time, which is a lot of sessions to put
+        through a small third-party relay for no gain.
 
-        So: an unchanged setpoint is not re-sent until it goes stale, and the
+        So an unchanged setpoint is not re-sent until it goes stale, and the
         cookie is reused rather than re-minted. Both counters reset whenever the
         spa stops reporting, so recovery from an outage still re-asserts
         everything from scratch.

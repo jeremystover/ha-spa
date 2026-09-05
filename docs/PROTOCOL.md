@@ -202,31 +202,46 @@ def websocket_message(flow: http.HTTPFlow):
 Remove the proxy setting and delete the CA certificate afterwards — a trusted
 root left installed is a standing risk.
 
-## The token goes stale, and it fails silently
+## The WF-100 can drop off the cloud, and nothing says so
 
-The token in `/spa/<token>/` is what authorises this integration. It is not
-permanent — re-pairing the module or regenerating the web link rotates it.
+The single most useful thing in this document. It happened in September 2026 and
+cost two days of cold water.
 
-When it dies, nothing says so. Observed over two days in September 2026:
+The WiFi module stops talking to `accsmartlink.com`. The spa is completely fine —
+the panel works, the heater works, the water is right there in front of you. But
+the relay is still up, so nothing on the Home Assistant side errors:
 
 | | |
 | --- | --- |
+| WebSocket `/wsb` | connects, then sends only `{"stsR": 0}` |
 | `GET /app` | 200, and the control page still renders |
 | The rendered page | no temperature, buttons inert |
 | `POST /settemp` | 200, setpoint silently discarded |
-| WebSocket `/wsb` | connects, then sends only `{"stsR": 0}` |
-| The iOS app | **unaffected** — it uses `/wsa/...` with its own credential |
+| Home Assistant log | nothing |
 
-`stsR: 0` on the browser endpoint means the session is not authorised. It does
-*not* mean the spa is offline; the spa was working normally by hand throughout,
-and the app never missed a beat.
+`stsR` is the relay's own link to the spa: `1` healthy, `0` gone. A captured page
+from a working day shows `stsR: 1` inline, which is what makes the reading solid.
 
-The tell is that the **web UI at the same token fails identically**. If the page
-loads but shows no temperature and its buttons do nothing, the token is dead and
-no amount of restarting Home Assistant will help. Get a fresh URL from the app
-and use the integration's **reconfigure** step — not delete-and-re-add, which
-mints new entity IDs and breaks every automation silently (see
-`config_flow.py`).
+### The trap: the phone app is not a connectivity test
+
+**The SmartLink app also speaks Bluetooth.** With the panel in range it keeps
+working perfectly while the WiFi module is off the cloud — same spa, same app,
+totally different transport.
+
+That cost hours of misdiagnosis: "the app works, so the module must be online"
+is wrong, and it argued away the correct answer. The app only proves the cloud
+path if you are nowhere near the spa.
+
+**The valid test is the web UI** at `/spa/<token>/app`. It rides the same cloud
+path as this integration, so it fails exactly when the integration does. A page
+that loads with no temperature and dead buttons means the module is off the
+cloud — not that the token is bad.
+
+### Recovery
+
+Reset the WF-100: **hold S1, press S2** on the board inside the module. It
+reconnects on the same token — no re-pairing, no new URL, nothing to reconfigure
+in Home Assistant. A power cycle at the breaker does not necessarily do this.
 
 ## Open questions
 

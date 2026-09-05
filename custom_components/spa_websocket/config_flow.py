@@ -48,11 +48,13 @@ class SpaConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Point an existing entry at a fresh URL.
 
-        The token embedded in the spa's URL is what authorises this integration,
-        and it goes stale -- re-pairing the module or regenerating the web link
-        rotates it. When it does, the relay keeps serving the page and answering
-        with 200 while silently routing nothing, so the spa appears connected and
-        simply stops obeying.
+        Needed whenever the token embedded in the spa's URL changes -- re-pairing
+        the module or regenerating the web link will do it.
+
+        Note that a spa which has stopped responding does *not* usually need
+        this. The WF-100 dropping off the cloud looks identical from here and is
+        far more common; it keeps the same token and is fixed at the module, not
+        in Home Assistant. See docs/PROTOCOL.md before reaching for a new URL.
 
         Recovering has to be an edit rather than a delete-and-re-add, because
         every entity's unique_id is derived from the config entry's id. A new

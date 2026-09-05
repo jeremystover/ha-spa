@@ -65,9 +65,8 @@ KEY_RELAY_STATUS = "stsR"
 
 # The session cookie the app page issues lasts about an hour. Fetching that page
 # before every single write minted a brand new session roughly twenty-four times
-# a day on one token -- far more than a browser would ever do, and the leading
-# suspect for the token going dead on its own. Reuse the cookie until it is close
-# to expiring instead.
+# a day -- a lot of sessions to put through a small third-party relay to
+# accomplish nothing. Reuse the cookie until it is close to expiring instead.
 SESSION_MAX_AGE_SECONDS = 2700
 
 # How stale an unchanged setpoint may get before it is re-sent. The hourly
