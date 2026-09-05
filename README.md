@@ -113,15 +113,18 @@ The history-stats helper watches the `Heating` binary sensor, state `on`, type
 single edge, so a missed run — spa offline, expired relay session, HA restart —
 costs one hour instead of a whole day.
 
-**But the wire traffic is deliberately frugal.** The token authorising all of
-this went dead on its own about a day after the integration started fetching the
-app page every hour, each fetch minting a fresh session, while nothing was
-changed at the spa. Circumstantial, but twenty-four new sessions a day on one
-token is nothing a browser would produce. So an unchanged setpoint is not
-re-sent until it goes stale, the session cookie is reused rather than re-minted,
-and the clock is set once a day rather than forty-eight times. One simulated day
-of the schedule now costs 10 requests instead of 48. A setpoint changed at the
-panel is still corrected, just within six hours rather than within the hour.
+**But the wire traffic is deliberately frugal.** Re-asserting hourly does not
+require re-sending hourly: the setpoint genuinely differs twice a day, and the
+other twenty-two writes restate what the spa already has. So an unchanged
+setpoint waits until it goes stale, the session cookie is reused rather than
+re-minted before every POST, and the clock is set once a day rather than
+forty-eight times — 10 requests a day instead of 48, against a small third-party
+relay built for a browser. A setpoint changed at the panel is still corrected,
+within six hours rather than within the hour; that is the one property traded
+away, and the hold switch remains the intended path for a deliberate override.
+
+The recovery property is untouched: any gap in reporting clears what the
+integration thinks the spa has, so the next run re-asserts from scratch.
 
 **The clock is written, never checked.** It can't be read back: the display
 multiplexes to water temperature at idle. Writing the correct time to an
@@ -167,6 +170,29 @@ filter schedule doesn't gate heat.
 
 The verification automation will tell you whether heat is happening at all; it
 deliberately does not alarm on merely falling short of target.
+
+## Troubleshooting: everything looks fine and the spa ignores you
+
+The WF-100 drops off the cloud. The spa itself is unaffected — panel works,
+heater works — but the relay stays up, so nothing errors. Before v1.7.0 this
+produced two days of cold water with every automation reporting success and an
+empty log.
+
+Symptoms: entities `unavailable`, or (pre-1.7.0) frozen on plausible-looking
+values; setpoint writes that appear to succeed and change nothing.
+
+**Do not test this with the phone app.** The SmartLink app also speaks
+Bluetooth, so within range of the spa it works perfectly while the cloud path is
+dead. It proves nothing about connectivity and will actively mislead you.
+
+**Test with the web UI** at `https://accsmartlink.com/spa/<token>/app`, which
+rides the same cloud path as this integration. If it loads but shows no
+temperature and its buttons do nothing, the module is off the cloud.
+
+**Fix:** reset the WF-100 — hold **S1**, press **S2** on the board inside the
+module. It reconnects on the same token; nothing in Home Assistant needs
+changing. Reconfiguring with a new URL is for an actually-changed token, which
+is a different and rarer problem.
 
 ## Reference
 
