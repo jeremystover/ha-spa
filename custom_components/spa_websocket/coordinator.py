@@ -93,6 +93,10 @@ class SpaConnection:
         # a live link to the spa. Both feed `available` -- see that property for
         # why a dead link is otherwise completely silent.
         self.last_frame_at: datetime | None = None
+        # When the socket last opened. Distinct from last_frame_at because a
+        # fresh connection that has not spoken yet is not the same as one that
+        # has gone quiet -- see `available`.
+        self.connected_at: datetime | None = None
         self.relay_linked: bool = True
         # What was last written and when, and when the session cookie was last
         # minted. Both exist to keep traffic down -- see async_set_temperature --
@@ -126,13 +130,31 @@ class SpaConnection:
         Observed in the field: the setpoint was written on schedule for two days
         while the water cooled from 99F to 83F, with every automation reporting
         success and not one error in the log.
+
+        Silence is measured from the connection as well as from the last frame,
+        because those are different situations and only one of them is a fault.
+        Having heard nothing YET on a socket that just opened is no information;
+        having heard nothing for an hour on a socket that was working is a fault.
+        Without this every Home Assistant restart looked like an outage and
+        stayed that way until a frame happened to arrive -- which, given how
+        bursty they are, can be half an hour. It made restarts page people and
+        made setpoint writes refuse for no reason.
+
+        Granting that grace cannot hide the real failure: a relay that has lost
+        the spa says so in KEY_RELAY_STATUS on connect, and that is checked first.
         """
         if not self.relay_linked:
             return False
-        if self.last_frame_at is None:
+
+        heard_from = self.last_frame_at
+        if self.connected_at is not None and (
+            heard_from is None or self.connected_at > heard_from
+        ):
+            heard_from = self.connected_at
+        if heard_from is None:
             return False
-        age = (dt_util.utcnow() - self.last_frame_at).total_seconds()
-        return age < STALE_AFTER_SECONDS
+
+        return (dt_util.utcnow() - heard_from).total_seconds() < STALE_AFTER_SECONDS
 
     @property
     def _base_url(self) -> str:
@@ -314,6 +336,7 @@ class SpaConnection:
             try:
                 async with session.ws_connect(self.url, heartbeat=HEARTBEAT) as ws:
                     self._ws = ws
+                    self.connected_at = dt_util.utcnow()
                     _LOGGER.info("Spa WebSocket connected to %s", self.url)
                     async for msg in ws:
                         if msg.type in (

@@ -90,6 +90,22 @@ check("available (relay still says 0)", c.available, False)
 c._handle_message('{"stsR":1}')
 check("available (relay recovered)", c.available, True)
 
+print("\na freshly opened socket is NO information, not bad information:")
+print("  (without this, every HA restart looked like an outage and paged)")
+cfresh = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
+NOW[0] = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+check("no socket, no frames -> unavailable", cfresh.available, False)
+cfresh.connected_at = NOW[0]
+check("just connected, no frame yet -> available", cfresh.available, True)
+NOW[0] = datetime(2026, 9, 8, 12, 30, tzinfo=timezone.utc)
+check("30m connected, still no frame -> available", cfresh.available, True)
+NOW[0] = datetime(2026, 9, 8, 13, 1, tzinfo=timezone.utc)
+check("over an hour of nothing -> unavailable", cfresh.available, False)
+print("  but a relay that says it lost the spa is still caught at once:")
+cfresh.connected_at = NOW[0]
+cfresh._handle_message('{"stsR":0}')
+check("connected but relay says offline", cfresh.available, False)
+
 print("\nthe real-world case — relay up, spa gone, only stsR:0 arriving:")
 c2 = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
 c2._handle_message('{"stsR":0}')
