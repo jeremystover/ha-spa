@@ -27,7 +27,16 @@ commands sent in the gap. A 20-second WebSocket heartbeat fixes it.
 
 ## Status frames
 
-The spa pushes `{"dsp": "<12 hex chars>"}`, six bytes:
+The spa pushes `{"dsp": "<12 hex chars>"}`, six bytes.
+
+**They are bursty, not a stream.** Frames arrive in clusters when the panel
+changes and stop entirely in between. Over six healthy hours the gaps ran ten to
+thirty minutes, the longest thirty-three — with the water at 100-104 °F and
+nothing wrong. Anything that treats a short silence as a fault will cry wolf: a
+five-minute staleness threshold produced ten false offline alarms in those six
+hours. Absence of frames is a very slow signal; `stsR` is the fast one.
+
+The layout:
 
 ```
   00      7d      6f      ce      14      00
@@ -188,7 +197,7 @@ app with mitmproxy or Charles and read the WebSocket **messages**, not the
 handshake. Exporting a WebSocket flow "as cURL" only ever yields the HTTP
 upgrade request; the payload lives in frames that have no cURL representation.
 A mitmproxy addon that prints only client-to-server frames cuts through the
-once-a-second `dsp` telemetry:
+`dsp` telemetry:
 
 ```python
 from mitmproxy import http

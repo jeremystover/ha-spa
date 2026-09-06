@@ -68,8 +68,15 @@ c._handle_message(FRAME)
 check("available", c.available, True)
 check("temperature decoded", c.temperature, 91)
 
+print("\na quiet gap is NORMAL — frames arrive in bursts, not a stream:")
+print("  (a 5-minute threshold produced 10 false alarms in 6 healthy hours)")
+for minutes in (10, 30, 45):
+    NOW[0] = datetime(2026, 9, 5, 0, minutes, tzinfo=timezone.utc)
+    check(f"still available after {minutes}m of silence", c.available, True)
+
 print(f"\nafter {STALE_AFTER_SECONDS}s of silence:")
-NOW[0] += timedelta(seconds=STALE_AFTER_SECONDS + 1)
+NOW[0] = datetime(2026, 9, 5, 0, 0, tzinfo=timezone.utc) + timedelta(
+    seconds=STALE_AFTER_SECONDS + 1)
 check("available", c.available, False)
 
 print("\nrelay chatter must NOT count as the spa reporting:")

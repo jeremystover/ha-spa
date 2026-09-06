@@ -46,13 +46,22 @@ DSP_FLAG_TO_STATE = (
 # How long to wait before reconnecting after the socket drops.
 RECONNECT_DELAY = 5
 
-# The spa pushes a display frame roughly once a second. If those stop, nothing
+# How long without a display frame means the spa is gone. When it is, nothing
 # errors: the relay stays reachable, keeps the socket open, and keeps answering
 # HTTP with 200 -- it simply has nothing from the spa to forward. Every reading
-# then goes quietly stale and every command is accepted and dropped. Treat a gap
-# this long as the spa being offline. Generous enough not to flap on a
-# reconnect, short enough to catch it within one enforcement cycle.
-STALE_AFTER_SECONDS = 300
+# goes quietly stale and every command is accepted and dropped.
+#
+# An hour, which looks absurdly long until you watch the real cadence. Display
+# frames do NOT stream steadily. They arrive in bursts when the panel changes
+# and stop entirely in between: over six healthy hours on 5 September 2026, with
+# the water sitting at 100-104F the whole time, gaps between frames routinely ran
+# ten to thirty minutes and the longest was thirty-three. A five-minute threshold
+# produced ten false offline alarms in those six hours.
+#
+# So this is not the fast signal, and it should not pretend to be. KEY_RELAY_STATUS
+# is: the relay says outright when it has lost the spa. This is the backstop for a
+# link that dies without ever saying so, where an hour of total silence is real.
+STALE_AFTER_SECONDS = 3600
 
 # How often to re-evaluate staleness. Availability is time-based, so without a
 # tick nothing recomputes it once frames stop -- the very situation it exists to
