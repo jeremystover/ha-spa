@@ -13,11 +13,14 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     ATTR_CODE,
+    ATTR_SECONDS,
     ATTR_TIMEZONE,
     CONF_URL,
     DOMAIN,
+    MAX_READING_SECONDS,
     SERVICE_SEND_RAW,
     SERVICE_SET_TIME,
+    SERVICE_TAKE_READING,
 )
 from .coordinator import SpaConnection
 
@@ -30,6 +33,13 @@ PLATFORMS: list[Platform] = [
 
 SEND_RAW_SCHEMA = vol.Schema({vol.Required(ATTR_CODE): cv.string})
 SET_TIME_SCHEMA = vol.Schema({vol.Optional(ATTR_TIMEZONE): cv.string})
+TAKE_READING_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_SECONDS): vol.All(
+            vol.Coerce(float), vol.Range(min=1, max=MAX_READING_SECONDS)
+        )
+    }
+)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -59,8 +69,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(
         DOMAIN, SERVICE_SEND_RAW, handle_send_raw, schema=SEND_RAW_SCHEMA
     )
+    async def handle_take_reading(call: ServiceCall) -> None:
+        """Connect to every configured spa and take a reading."""
+        seconds = call.data.get(ATTR_SECONDS)
+        for conn in hass.data[DOMAIN].values():
+            await conn.async_take_reading(seconds)
+
     hass.services.async_register(
         DOMAIN, SERVICE_SET_TIME, handle_set_time, schema=SET_TIME_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_TAKE_READING, handle_take_reading, schema=TAKE_READING_SCHEMA
     )
     return True
 
@@ -73,4 +92,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, SERVICE_SEND_RAW)
             hass.services.async_remove(DOMAIN, SERVICE_SET_TIME)
+            hass.services.async_remove(DOMAIN, SERVICE_TAKE_READING)
     return unload_ok

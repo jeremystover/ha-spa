@@ -44,6 +44,7 @@ from .const import (
     FLAG_HEATING,
     HEARTBEAT,
     JOB_CLOCK,
+    JOB_READING,
     JOB_SETPOINT,
     KEY_RELAY_STATUS,
     PATH_APP,
@@ -120,6 +121,12 @@ class SpaConnection:
 
         # How each scheduled job last went. This is the alarm surface.
         self.jobs: dict[str, JobResult] = {}
+
+        # Display frames seen, ever. Only ever compared against itself, to ask
+        # "did the panel speak during that visit" -- which cannot be answered by
+        # the trailing listen alone, because the frame often arrives during the
+        # opening one and would then be counted as silence.
+        self._frames = 0
 
         self._listeners: list[Callable[[], None]] = []
         # Its own cookie jar: the settemp POST is authenticated by a session
@@ -207,6 +214,7 @@ class SpaConnection:
         """
         listen = VISIT_SECONDS if listen is None else listen
         self.relay_linked = None
+        before = self._frames
         session = async_get_clientsession(self.hass)
         async with session.ws_connect(self.url, heartbeat=HEARTBEAT) as ws:
             # Give the relay its moment to volunteer stsR before acting on it.
@@ -218,9 +226,10 @@ class SpaConnection:
                         "would have been accepted and discarded"
                     )
                 await ws.send_str(send)
-            spoke = await self._listen(ws, listen)
+            if self._frames == before:
+                await self._listen(ws, listen)
         self._notify_listeners()
-        return spoke
+        return self._frames > before
 
     # ---- the three jobs ------------------------------------------------------
 
@@ -327,18 +336,51 @@ class SpaConnection:
             JOB_CLOCK, True, f"clock frame delivered ({when:%-I:%M %p} spa-local)"
         )
 
-    async def async_refresh(self) -> None:
-        """Take a reading now, on demand.
+    async def async_take_reading(
+        self, seconds: float | None = None, record: bool = True
+    ) -> bool:
+        """Connect, wait for the panel to say something, and hang up.
 
-        May come back with nothing: frames arrive in bursts and a quiet spa can
-        easily say nothing for half an hour. The reading's timestamp is what
-        tells you whether it worked, so this never raises on silence.
+        This is what answers the question a confirmed setpoint cannot: the spa
+        accepting 103F says nothing about whether the water actually moved. Only
+        a reading taken at the end of the window does.
+
+        May come back with nothing -- frames arrive in bursts and a quiet spa can
+        say nothing for half an hour -- so silence never raises. It is recorded
+        as a failed reading instead, because "I could not look" is a different
+        thing from "I looked and it was fine", and the checks downstream need to
+        tell them apart rather than compare against a stale number.
+
+        ``record`` is off for the Refresh button: a human pressing it and getting
+        nothing should not set off an alarm.
         """
+        window = REFRESH_SECONDS if seconds is None else seconds
         try:
-            if not await self._visit(listen=REFRESH_SECONDS):
-                _LOGGER.info("Spa said nothing during the refresh window")
+            spoke = await self._visit(listen=window)
         except (aiohttp.ClientError, OSError, TimeoutError) as err:
+            if record:
+                self._record(JOB_READING, False, f"could not reach the spa: {err}")
             raise HomeAssistantError(f"Could not reach the spa: {err}") from err
+
+        if record:
+            if spoke:
+                self._record(
+                    JOB_READING,
+                    True,
+                    f"{self.temperature}°{self.temperature_unit}",
+                )
+            else:
+                self._record(
+                    JOB_READING,
+                    False,
+                    f"connected, but the panel sent nothing in {window:.0f}s — "
+                    "no reading to check the water against",
+                )
+        return spoke
+
+    async def async_refresh(self) -> None:
+        """Take a reading for a human who asked for one. Never sets the alarm."""
+        await self.async_take_reading(record=False)
 
     async def async_press(self, code: str) -> None:
         """Send one command code, opening a socket for it."""
@@ -376,6 +418,7 @@ class SpaConnection:
         # A display frame is the panel's own output, so it is proof of a live
         # link whatever the relay last claimed.
         self.relay_linked = True
+        self._frames += 1
         flags = int(dsp[8:10], 16)
 
         self.jets_state = STATE_OFF

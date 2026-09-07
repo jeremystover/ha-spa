@@ -35,6 +35,7 @@ old, and its timestamp is what says so.
 | Service | Fields | Purpose |
 | --- | --- | --- |
 | `spa_websocket.set_time` | `timezone` (optional IANA name) | Sets the panel clock |
+| `spa_websocket.take_reading` | `seconds` (optional) | Connects and waits for the panel to report |
 | `spa_websocket.send_raw` | `code` | Diagnostic — sends one raw frame |
 
 `set_time` defaults to Home Assistant's own timezone, which is correct only if
@@ -129,6 +130,29 @@ If any of the three does not confirm, **Action failed** turns on and names the
 job. That is the only alarm, and it replaces the old "is the spa online" alert,
 which was both noisy and beside the point: an offline spa at 4am matters only
 because of what it stops happening at noon.
+
+### Confirming the setpoint is not confirming the heat
+
+A spa that accepts 103 °F and does nothing about it looks identical, over the
+wire, to one that heats. So the setpoint jobs answer only half the question, and
+`spa_websocket.take_reading` answers the other half: connect at the checkpoint,
+wait for the panel, and compare the water against what the time of day says it
+should be.
+
+Two checks worth running, both from readings rather than from commands:
+
+- **Did the heater ever kick in?** Take a reading at each end of the afternoon
+  window. Three hours at 103 °F with no rise means the setpoint landed and the
+  heat did not.
+- **Is the water where it should be for this hour?** The 04:00 clock visit
+  already yields a reading; water well under the floor at 4am means the spa is
+  not holding it overnight.
+
+A reading that comes back empty is recorded as a **failed** reading rather than
+passing quietly, because "I could not look" has to be distinguishable from "I
+looked and it was fine" — checking the water against a stale number is how you
+miss a cold tub. The Refresh button is exempt: a human pressing it and getting
+nothing should not set off an alarm.
 
 ### Design notes
 

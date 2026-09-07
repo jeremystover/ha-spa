@@ -79,6 +79,14 @@ CONFIRM_DELAY_SECONDS = 5
 # The scheduled jobs, named so a failure can say which one.
 JOB_SETPOINT = "setpoint"
 JOB_CLOCK = "clock"
+JOB_READING = "reading"
+
+# The longest a scheduled reading may listen. A confirmed setpoint says the spa
+# accepted a number; it says nothing about whether the water moved. Answering
+# that needs an actual reading AT the checkpoint, and frames are bursty enough
+# that thirty seconds is a coin toss -- so a background job is allowed to wait
+# properly. It returns the moment a frame arrives; only silence costs the window.
+MAX_READING_SECONDS = 600
 
 # WebSocket ping interval. The relay closes idle connections after ~60s, which
 # matters even for short visits: a quiet listen would otherwise be hung up on
@@ -88,6 +96,10 @@ HEARTBEAT = 20
 # Diagnostic service for probing the spa's undocumented command codes.
 SERVICE_SEND_RAW = "send_raw"
 ATTR_CODE = "code"
+
+# Taking a reading on demand, with a listening window the caller chooses.
+SERVICE_TAKE_READING = "take_reading"
+ATTR_SECONDS = "seconds"
 
 # Setting the spa's clock. The spa is not necessarily in the same timezone as
 # the Home Assistant host -- this one runs three hours behind it -- so the zone
