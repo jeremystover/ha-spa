@@ -43,66 +43,46 @@ DSP_FLAG_TO_STATE = (
     (FLAG_FILTERING, STATE_FILTERING),
 )
 
-# How long to wait before reconnecting after the socket drops.
-RECONNECT_DELAY = 5
-
-# How long without a display frame means the spa is gone. When it is, nothing
-# errors: the relay stays reachable, keeps the socket open, and keeps answering
-# HTTP with 200 -- it simply has nothing from the spa to forward. Every reading
-# goes quietly stale and every command is accepted and dropped.
-#
-# An hour, which looks absurdly long until you watch the real cadence. Display
-# frames do NOT stream steadily. They arrive in bursts when the panel changes
-# and stop entirely in between: over six healthy hours on 5 September 2026, with
-# the water sitting at 100-104F the whole time, gaps between frames routinely ran
-# ten to thirty minutes and the longest was thirty-three. A five-minute threshold
-# produced ten false offline alarms in those six hours.
-#
-# So this is not the fast signal, and it should not pretend to be. KEY_RELAY_STATUS
-# is: the relay says outright when it has lost the spa. This is the backstop for a
-# link that dies without ever saying so, where an hour of total silence is real.
-STALE_AFTER_SECONDS = 3600
-
-# How often to re-evaluate staleness. Availability is time-based, so without a
-# tick nothing recomputes it once frames stop -- the very situation it exists to
-# detect.
-STALENESS_TICK_SECONDS = 60
-
 # The relay reports its own link to the spa in a "stsR" frame. Zero means it has
-# no live link, which is the state that produces silent command loss.
+# no live link, which is the state that produces silent command loss -- every
+# command accepted, acknowledged, and dropped. It volunteers this on connect,
+# promptly and reliably; on a socket left open it goes quiet for hours, which is
+# the whole reason this integration no longer keeps one open.
 KEY_RELAY_STATUS = "stsR"
 
-# How often to reopen the socket while the spa looks offline.
+# How long to listen on a visit before hanging up.
 #
-# The relay states its link ON CONNECT, promptly and reliably. On a socket that
-# is already open it volunteers stsR only sporadically, and that gap is not
-# academic: on 6 September 2026 the WF-100 was reset and came back within
-# moments, and the relay did not say so on our open socket for another two hours
-# and seven minutes. Home Assistant reported a healthy spa as offline that whole
-# time, and would have gone on doing it.
-#
-# So while nothing is reporting, hang up and dial again on this interval. A
-# reconnect is the one thing that forces a current answer out of the relay, it
-# costs a single handshake, and it only happens when something is already wrong.
-RELINK_PROBE_SECONDS = 300
+# Best effort, never a verdict. Display frames arrive in bursts and go quiet in
+# between -- ten to thirty minute gaps are normal on a healthy spa, the longest
+# measured thirty-three -- so a visit can easily end having heard nothing. That
+# is why no confirmation depends on hearing a frame: the setpoint is confirmed
+# over HTTP, and a frame caught here is only a bonus reading.
+VISIT_SECONDS = 60
 
-# The session cookie the app page issues lasts about an hour. Fetching that page
-# before every single write minted a brand new session roughly twenty-four times
-# a day -- a lot of sessions to put through a small third-party relay to
-# accomplish nothing. Reuse the cookie until it is close to expiring instead.
-SESSION_MAX_AGE_SECONDS = 2700
+# The same, for a reading the user asked for by pressing a button. Shorter,
+# because a button that appears to hang for a minute is worse than one that
+# comes back honestly empty.
+REFRESH_SECONDS = 30
 
-# How stale an unchanged setpoint may get before it is re-sent. The hourly
-# schedule exists so a lost write costs an hour rather than a day, but the value
-# is genuinely different only twice a day -- the other twenty-two writes restate
-# what the spa already has. Re-asserting on this cadence keeps the recovery
-# property while dropping most of the traffic. It also still corrects a setpoint
-# changed at the panel, just not within the hour.
-SETPOINT_REASSERT_SECONDS = 21600
+# How long to let the relay volunteer its link state after connecting. It states
+# it on connect, promptly -- it is on an already-open socket that it goes quiet,
+# which is the whole reason this integration no longer keeps one.
+RELAY_ANSWER_SECONDS = 10
+
+# Confirming a setpoint: how many times to re-read the spa's own page, and how
+# long to wait between tries. A fresh page load rather than the POST's echo,
+# because whether that echo carries the new value or the old one was never
+# established against the hardware.
+CONFIRM_ATTEMPTS = 3
+CONFIRM_DELAY_SECONDS = 5
+
+# The scheduled jobs, named so a failure can say which one.
+JOB_SETPOINT = "setpoint"
+JOB_CLOCK = "clock"
 
 # WebSocket ping interval. The relay closes idle connections after ~60s, which
-# left the socket down for part of every minute and dropped commands sent in
-# the gap.
+# matters even for short visits: a quiet listen would otherwise be hung up on
+# from the far end partway through.
 HEARTBEAT = 20
 
 # Diagnostic service for probing the spa's undocumented command codes.

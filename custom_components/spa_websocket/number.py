@@ -26,8 +26,10 @@ async def async_setup_entry(
 class SpaTargetTemperature(NumberEntity):
     """The spa's target temperature.
 
-    The spa does not report its setpoint on the socket except while the panel is
-    being edited, so the value shown is the last one set through Home Assistant.
+    Shows the spa's own answer, read back off its page after every write, not
+    the value Home Assistant last sent. Setting it raises if the spa does not
+    confirm, so a scheduled change that goes nowhere fails loudly instead of
+    looking like success.
     """
 
     _attr_has_entity_name = True
@@ -49,28 +51,20 @@ class SpaTargetTemperature(NumberEntity):
             name=entry.title,
             manufacturer="Spa",
         )
-        self._value: float | None = None
 
-    @property
-    def available(self) -> bool:
-        """Return False while the spa is not reporting."""
-        return self._connection.available
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to updates."""
+        self.async_on_remove(self._connection.add_listener(self.async_write_ha_state))
 
     @property
     def native_value(self) -> float | None:
-        """Return the spa's setpoint, preferring what the spa itself reports.
-
-        Falls back to the last value written from Home Assistant, which is all
-        that was available before the readback existed — and which is exactly
-        the assumption that let two days of discarded setpoints look like
-        success.
-        """
-        if self._connection.reported_setpoint is not None:
-            return self._connection.reported_setpoint
-        return self._value
+        """Return the setpoint the spa reports, or nothing if it never has."""
+        return self._connection.reported_setpoint
 
     async def async_set_native_value(self, value: float) -> None:
-        """Send a new setpoint to the spa."""
-        await self._connection.async_set_temperature(int(value))
-        self._value = value
-        self.async_write_ha_state()
+        """Set the setpoint and confirm the spa took it.
+
+        Raises when it cannot be confirmed. The caller finding out is the point:
+        believing our own writes is what let the water cool for two days.
+        """
+        await self._connection.async_apply_setpoint(int(value))
