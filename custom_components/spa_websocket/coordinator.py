@@ -277,13 +277,6 @@ class SpaConnection:
 
         self._record(JOB_SETPOINT, True, f"spa confirms {reported}F")
 
-        # Opportunistic, and never allowed to fail the job: while we are here,
-        # see whether the panel has anything to say.
-        try:
-            await self._visit()
-        except (aiohttp.ClientError, OSError, TimeoutError) as err:
-            _LOGGER.debug("No reading taken after the setpoint change: %s", err)
-
     async def _read_back(self, expected: int) -> int | None:
         """Return the spa's own setpoint, retrying while it settles."""
         reported = None
