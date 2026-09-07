@@ -296,13 +296,15 @@ check("frame proves otherwise", c.relay_linked, True)
 print("\n=== what a day now costs the relay ===")
 http = FakeHTTP()
 c = new_conn(http)
-run(c.async_apply_setpoint(103))    # 15:00 here / noon spa-local
-run(c.async_apply_setpoint(85))     # 18:00 here / 3pm spa-local
 _, session = with_socket([])
 coord.async_get_clientsession = lambda hass: session
+run(c.async_apply_setpoint(103))    # 15:00 here / noon spa-local
+run(c.async_apply_setpoint(85))     # 18:00 here / 3pm spa-local
+check("setpoint jobs are HTTP only", session.connects, 0)
 run(c.async_sync_clock(datetime(2026, 9, 8, 4, 0)))
+check("the clock job is the day's one visit", session.connects, 1)
 print(f"  HTTP requests: {http.gets + http.posts}   (was 48 hourly, then 10)")
-print("  socket:        3 short visits   (was open 24h with a 20s heartbeat)")
+print("  socket:        1 short visit    (was open 24h with a 20s heartbeat)")
 check("two setpoint writes", http.posts, 2)
 check("both confirmed", [j.ok for j in c.jobs.values()], [True, True])
 
