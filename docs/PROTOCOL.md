@@ -34,7 +34,15 @@ changes and stop entirely in between. Over six healthy hours the gaps ran ten to
 thirty minutes, the longest thirty-three — with the water at 100-104 °F and
 nothing wrong. Anything that treats a short silence as a fault will cry wolf: a
 five-minute staleness threshold produced ten false offline alarms in those six
-hours. Absence of frames is a very slow signal; `stsR` is the fast one.
+hours.
+
+Absence of frames is a very slow signal. `stsR` is the fast one **only on
+connect** — see below; on a socket that is already open the relay volunteers it
+whenever it feels like it, which has been measured at over two hours.
+
+Frames do carry one thing no `stsR` can contradict: a `dsp` frame is the panel's
+own output, and through a seven-hour outage not one arrived. So a display frame
+is positive proof of a live link, and outranks a stale `stsR: 0`.
 
 The layout:
 
@@ -251,6 +259,34 @@ cloud — not that the token is bad.
 Reset the WF-100: **hold S1, press S2** on the board inside the module. It
 reconnects on the same token — no re-pairing, no new URL, nothing to reconfigure
 in Home Assistant. A power cycle at the breaker does not necessarily do this.
+
+This works, reliably and within moments. Confirmed by the owner across three
+occurrences: the web UI shows the spa offline, the reset brings it straight
+back.
+
+### The relay only answers the question when you dial
+
+The catch, and it is worth more than the reset itself: **the relay states its
+link on connect, and only sporadically after that.**
+
+On 6 September 2026 the module was reset and came back at once. The relay did
+not volunteer `stsR: 1` on the socket Home Assistant already had open for
+another **two hours and seven minutes**. For that whole time a perfectly healthy
+spa was reported offline, setpoint writes were refused, and nothing anywhere
+said the information was stale. The same asymmetry ran the other way at the
+start of the outage: frames stopped at ~12:24 spa-local and `stsR: 0` did not
+arrive until 14:11.
+
+So an open socket is not a question, it is a subscription — and this relay is
+bad at publishing. Two things follow, both now implemented:
+
+- While nothing is reporting, **hang up and dial again** every few minutes
+  (`RELINK_PROBE_SECONDS`). A reconnect forces a current answer; it costs one
+  handshake and only happens when something is already wrong.
+- **A display frame clears a stale offline verdict**, per the reasoning under
+  Status frames above.
+
+Recovery detection went from over two hours to under five minutes.
 
 ## Open questions
 
