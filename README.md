@@ -10,17 +10,25 @@ absolute setpoint control, a heater sensor, and a clock setter — see
 
 ## What it creates
 
-One shared, auto-reconnecting WebSocket, plus a short-lived HTTPS session for
-the one thing that isn't a socket command.
+**Nothing stays connected.** The integration visits the spa three times a day,
+confirms what it came to do, and hangs up. See [Three jobs a day](#three-jobs-a-day).
 
 | Entity | Type | Behavior |
 | --- | --- | --- |
 | **Jets** | `button` | Sends `"3"` |
 | **Filter** | `button` | Sends `"4"` — the web app calls this code `system` |
+| **Refresh** | `button` | Connects now and takes a reading, if the spa speaks |
 | **Jets status** | `sensor` (enum) | `Off` / `Low` / `High` / `Filtering` |
-| **Temperature** | `sensor` | Water temperature, decoded from the panel display |
-| **Target temperature** | `number` | Setpoint, 65–104 °F |
-| **Heating** | `binary_sensor` | Whether the heater element is firing |
+| **Temperature** | `sensor` | Water temperature; `measured_at` says how old it is |
+| **Confirmed setpoint** | `sensor` | What the **spa** says its setpoint is |
+| **Target temperature** | `number` | Setpoint, 65–104 °F; raises if unconfirmed |
+| **Heating** | `binary_sensor` | Whether the heater was firing at the last reading |
+| **Filtering** | `binary_sensor` | Whether a filter cycle was running |
+| **Action failed** | `binary_sensor` (problem) | **The alarm.** On when a job did not confirm |
+
+Every reading is the last one the spa gave, with the time it gave it. Entities
+do not go `unavailable` between visits: an hours-old reading is not wrong, it is
+old, and its timestamp is what says so.
 
 ### Services
 
@@ -107,37 +115,56 @@ The history-stats helper watches the `Heating` binary sensor, state `on`, type
 | 18:00–06:00 | 15:00–03:00 | Peak. The spa still holds 85 °F on demand — this is the floor's cost |
 | 02:00 | 23:00 | FP2 filters; heat here depends on the floor, not on FP2 |
 
+### Three jobs a day
+
+Three things have to happen each day. Everything else was scaffolding.
+
+| Job | When | Confirmed by |
+| --- | --- | --- |
+| **Clock** | 07:00 HA / 04:00 spa | *Delivery only* — see below |
+| **Setpoint → 103 °F** | 15:00 HA / 12:00 spa | The spa's own page reports 103 |
+| **Setpoint → 85 °F** | 18:00 HA / 15:00 spa | The spa's own page reports 85 |
+
+If any of the three does not confirm, **Action failed** turns on and names the
+job. That is the only alarm, and it replaces the old "is the spa online" alert,
+which was both noisy and beside the point: an offline spa at 4am matters only
+because of what it stops happening at noon.
+
 ### Design notes
 
-**Hourly, not once.** Every enforcement re-asserts rather than firing on a
-single edge, so a missed run — spa offline, expired relay session, HA restart —
-costs one hour instead of a whole day.
+**Ask, do not subscribe.** The relay states its link on connect, promptly and
+reliably; on a socket left open it goes quiet for hours. Holding one open meant
+believing a stale answer — on 6 September 2026, for 2h07m after the spa had
+already come back. Three deliberate visits beat a standing connection that
+nobody is updating.
 
-**But the wire traffic is deliberately frugal.** Re-asserting hourly does not
-require re-sending hourly: the setpoint genuinely differs twice a day, and the
-other twenty-two writes restate what the spa already has. So an unchanged
-setpoint waits until it goes stale, the session cookie is reused rather than
-re-minted before every POST, and the clock is set once a day rather than
-forty-eight times — 10 requests a day instead of 48, against a small third-party
-relay built for a browser. A setpoint changed at the panel is still corrected,
-within six hours rather than within the hour; that is the one property traded
-away, and the hold switch remains the intended path for a deliberate override.
+**Six HTTP requests a day, and three short visits.** Down from 48 requests and a
+socket held open around the clock with a ping every twenty seconds. The relay is
+a small third-party service built for a browser tab.
 
-The recovery property is untouched: any gap in reporting clears what the
-integration thinks the spa has, so the next run re-asserts from scratch.
+**Confirmation is a fresh page load, not the POST's echo.** Whether the echo
+carries the new value or the pre-write one was never established against the
+hardware, so trusting it would be guessing. A page fetched a few seconds later
+is the spa's settled answer. A page that comes back with *no* setpoint at all is
+the WF-100 signature — 200 OK, a rendered page, nothing behind it — and is
+reported as exactly that.
 
-**The clock is written, never checked.** It can't be read back: the display
-multiplexes to water temperature at idle. Writing the correct time to an
-already-correct clock changes nothing, which makes blind re-assertion safe and
-removes the need for a verify-then-fix path that the hardware can't support.
+**The clock is written, never confirmed, and says so.** It cannot be read back:
+the display multiplexes between water temperature and setpoint, never the time.
+So the clock job records *delivery* — the socket opened, the relay did not say
+it had lost the spa, the frame went out — which is weaker than the setpoint's
+confirmation and is labelled as such rather than dressed up as proof.
 
-**Verification is by consequence.** Nothing raises an error when heating fails:
-the schedule reports success as long as the POST returns 200, which says nothing
-about whether the water moved. The heat window sensor measures heater runtime
-instead — zero runtime across a whole window, with the water below target, means
-the spa isn't acting on the setpoint at all. It uses `history_stats` rather than
-a `for:` duration because `for:` clocks reset on every restart and every
-`unavailable` blip.
+The way to close that gap is the filter cycle, since FP1 is programmed against
+the same clock: a **Filtering** bit that comes on at noon spa-local is a clock
+that is right. That bit is now exposed and recorded. Nothing acts on it yet —
+watch it for a few days and build the check on evidence.
+
+**Losing hourly re-assertion is the trade.** A setpoint changed at the panel is
+no longer corrected within the hour, and a job that fails is not silently
+retried sixty minutes later. In exchange, a failure is *visible* rather than
+papered over by the next run — which is the trade worth making, because the
+failure mode this integration exists to catch was never loud.
 
 **The hold expires.** An open-ended override is a rental hazard — a guest flips
 it, leaves, and the tub heats through peak indefinitely. It clears at the end of

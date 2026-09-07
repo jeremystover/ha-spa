@@ -278,15 +278,39 @@ start of the outage: frames stopped at ~12:24 spa-local and `stsR: 0` did not
 arrive until 14:11.
 
 So an open socket is not a question, it is a subscription — and this relay is
-bad at publishing. Two things follow, both now implemented:
+bad at publishing. Taken to its conclusion, that is an argument against holding
+one at all: **connect when there is something to do, confirm it, hang up.**
+Which is what the integration now does — three visits a day, six HTTP requests,
+nothing standing open. A display frame still clears a stale offline verdict, per
+the reasoning under Status frames above.
 
-- While nothing is reporting, **hang up and dial again** every few minutes
-  (`RELINK_PROBE_SECONDS`). A reconnect forces a current answer; it costs one
-  handshake and only happens when something is already wrong.
-- **A display frame clears a stale offline verdict**, per the reasoning under
-  Status frames above.
+## Confirming a write
 
-Recovery detection went from over two hours to under five minutes.
+`GET /app` renders the spa's live setpoint into the form it returns:
+
+```html
+<input type="number" name="void" ... value="85">
+```
+
+That is the readback, and it is the only honest one — the display multiplexes
+between water temperature and setpoint, so a frame cannot be trusted to be
+either.
+
+Two rules learned the hard way:
+
+- **Use a fresh page load, not the POST's echo.** Whether `settemp` echoes the
+  new value or the pre-write one has never been established against the
+  hardware. A page fetched a few seconds after the write is the settled answer.
+- **No setpoint in the page is not a parse failure.** It is the WF-100
+  signature. A relay that has lost the spa still returns 200 and still renders
+  the control page — just without a temperature on it. That is the single most
+  diagnostic response this API produces, and it is what two days of cold water
+  looked like from the outside.
+
+The clock has no equivalent and cannot be confirmed at all. The nearest proxy is
+the filter cycle, which is programmed against the same clock: FP1 runs noon to
+3pm spa-local, so a filtering bit (`0x10`) that comes on at noon is a clock that
+is right. Unverified — recorded so it can be checked against real days.
 
 ## Open questions
 

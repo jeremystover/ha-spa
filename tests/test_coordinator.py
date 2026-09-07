@@ -1,16 +1,18 @@
 """Drive the spa coordinator with the Home Assistant runtime stubbed out.
 
-Covers availability and the relay link, a full day of scheduled traffic, the
-setpoint readback, and the decoder's plausibility bound. No dependencies --
-run it with plain python3.
+The contract under test is narrow and deliberate: three jobs a day, each one
+confirmed against the spa's own account of itself, and a failure to confirm
+surfaced rather than swallowed. No dependencies -- run it with plain python3.
 """
 
+import asyncio
 import pathlib
 import sys
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 _HERE = pathlib.Path(__file__).resolve().parent.parent
+
 
 # --- minimal homeassistant stubs -------------------------------------------
 def _mod(name, **attrs):
@@ -20,11 +22,13 @@ def _mod(name, **attrs):
     sys.modules[name] = m
     return m
 
-NOW = [datetime(2026, 9, 5, 0, 0, tzinfo=timezone.utc)]
+
+NOW = [datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)]
 
 _mod("aiohttp", ClientError=type("ClientError", (Exception,), {}),
      ClientWebSocketResponse=object,
-     WSMsgType=types.SimpleNamespace(TEXT=1, BINARY=2, CLOSED=3, ERROR=4))
+     WSMsgType=types.SimpleNamespace(
+         TEXT=1, BINARY=2, CLOSE=3, CLOSED=4, CLOSING=5, ERROR=6))
 _mod("homeassistant")
 _mod("homeassistant.core", HomeAssistant=object, callback=lambda f: f)
 _mod("homeassistant.exceptions",
@@ -33,8 +37,6 @@ _mod("homeassistant.helpers")
 _mod("homeassistant.helpers.aiohttp_client",
      async_create_clientsession=lambda hass: None,
      async_get_clientsession=lambda hass: None)
-_mod("homeassistant.helpers.event",
-     async_track_time_interval=lambda hass, cb, iv: (lambda: None))
 _mod("homeassistant.util")
 _mod("homeassistant.util.dt", utcnow=lambda: NOW[0])
 
@@ -44,13 +46,21 @@ _pkg = types.ModuleType("spa_websocket")
 _pkg.__path__ = [str(_HERE / "custom_components" / "spa_websocket")]
 sys.modules["spa_websocket"] = _pkg
 
-from spa_websocket.coordinator import SpaConnection  # noqa: E402
-from spa_websocket.const import (  # noqa: E402
-    RELINK_PROBE_SECONDS,
-    STALE_AFTER_SECONDS,
-)
+import spa_websocket.coordinator as coord  # noqa: E402
+from spa_websocket.coordinator import SpaConnection, parse_setpoint  # noqa: E402
+from spa_websocket.const import JOB_CLOCK, JOB_SETPOINT  # noqa: E402
+from spa_websocket.decode import decode_temperature, plausible  # noqa: E402
 
-FRAME = '{"dsp":"007d30ce0500"}'
+HomeAssistantError = sys.modules["homeassistant.exceptions"].HomeAssistantError
+
+# Real waits would make this suite take a minute for no benefit.
+coord.CONFIRM_DELAY_SECONDS = 0
+coord.RELAY_ANSWER_SECONDS = 0.01
+coord.VISIT_SECONDS = 0.01
+coord.REFRESH_SECONDS = 0.01
+
+FRAME = '{"dsp":"007d30ce0500"}'          # 91F, heating + low jets
+FILTER_FRAME = '{"dsp":"007d30ce1000"}'   # filtering bit set
 fails = []
 
 
@@ -61,137 +71,24 @@ def check(label, got, want):
         fails.append(label)
 
 
-c = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
-
-print("before any frame (the state after a fresh reconnect):")
-check("available", c.available, False)
-
-print("\nafter a real display frame:")
-c._handle_message(FRAME)
-check("available", c.available, True)
-check("temperature decoded", c.temperature, 91)
-
-print("\na quiet gap is NORMAL — frames arrive in bursts, not a stream:")
-print("  (a 5-minute threshold produced 10 false alarms in 6 healthy hours)")
-for minutes in (10, 30, 45):
-    NOW[0] = datetime(2026, 9, 5, 0, minutes, tzinfo=timezone.utc)
-    check(f"still available after {minutes}m of silence", c.available, True)
-
-print(f"\nafter {STALE_AFTER_SECONDS}s of silence:")
-NOW[0] = datetime(2026, 9, 5, 0, 0, tzinfo=timezone.utc) + timedelta(
-    seconds=STALE_AFTER_SECONDS + 1)
-check("available", c.available, False)
-
-print("\nrelay chatter must NOT count as the spa reporting:")
-c._handle_message('{"stsR":0}')
-check("available", c.available, False)
-check("relay_linked", c.relay_linked, False)
-
-print("\na real display frame revives it on its own:")
-print("  (waiting for the relay to volunteer stsR:1 cost 2h07m on 6 September)")
-c._handle_message(FRAME)
-check("frame outranks a stale stsR:0", c.available, True)
-check("relay verdict cleared", c.relay_linked, True)
-
-print("\nand an explicit stsR:1 still works:")
-c._handle_message('{"stsR":0}')
-check("offline again", c.available, False)
-c._handle_message('{"stsR":1}')
-check("available (relay recovered)", c.available, True)
-
-print("\na freshly opened socket is NO information, not bad information:")
-print("  (without this, every HA restart looked like an outage and paged)")
-cfresh = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
-NOW[0] = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
-check("no socket, no frames -> unavailable", cfresh.available, False)
-cfresh.connected_at = NOW[0]
-check("just connected, no frame yet -> available", cfresh.available, True)
-NOW[0] = datetime(2026, 9, 8, 12, 30, tzinfo=timezone.utc)
-check("30m connected, still no frame -> available", cfresh.available, True)
-NOW[0] = datetime(2026, 9, 8, 13, 1, tzinfo=timezone.utc)
-check("over an hour of nothing -> unavailable", cfresh.available, False)
-print("  but a relay that says it lost the spa is still caught at once:")
-cfresh.connected_at = NOW[0]
-cfresh._handle_message('{"stsR":0}')
-check("connected but relay says offline", cfresh.available, False)
-
-print("\nthe real-world case — relay up, spa gone, only stsR:0 arriving:")
-c2 = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
-c2._handle_message('{"stsR":0}')
-check("available", c2.available, False)
+def run(coro):
+    return asyncio.run(coro)
 
 
-# --- reopening the socket to ask the relay again ----------------------------
-class FakeWS:
-    """Records that the socket was closed, which is what forces a redial."""
-
-    def __init__(self):
-        self.closed = False
-        self.close_calls = 0
-
-    def close(self):
-        self.close_calls += 1
-        self.closed = True
-
-
-class FakeHass:
-    def __init__(self):
-        self.tasks = []
-
-    def async_create_task(self, coro):
-        self.tasks.append(coro)
-
-
-print("\nwhile offline, redial on an interval instead of waiting to be told:")
-print("  (the WF-100 came back in moments; we believed it offline for 2h07m)")
-hass, ws = FakeHass(), FakeWS()
-c5 = SpaConnection(hass, "wss://h/spa/TOKEN/wsb")
-c5._ws = ws
-NOW[0] = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
-c5._handle_message('{"stsR":0}')
-check("offline", c5.available, False)
-c5._async_check_staleness(NOW[0])
-check("first tick redials", ws.close_calls, 1)
-
-ws.closed = False
-NOW[0] = datetime(2026, 9, 8, 0, 1, tzinfo=timezone.utc)
-c5._async_check_staleness(NOW[0])
-check("no redial storm a minute later", ws.close_calls, 1)
-
-ws.closed = False
-NOW[0] = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc) + timedelta(
-    seconds=RELINK_PROBE_SECONDS + 1)
-c5._async_check_staleness(NOW[0])
-check("redials once the interval passes", ws.close_calls, 2)
-
-print("\na healthy connection is never disturbed:")
-ws.closed = False
-c5._handle_message(FRAME)
-check("healthy again", c5.available, True)
-NOW[0] += timedelta(seconds=RELINK_PROBE_SECONDS + 1)
-c5._async_check_staleness(NOW[0])
-check("socket left alone", ws.close_calls, 2)
-
-
-
-# --- traffic: a full simulated day of the hourly schedule --------------------
-import asyncio  # noqa: E402
-
-
+# --- fake HTTP ---------------------------------------------------------------
 APP_PAGE = (
     '<form method="post" action="https://h/spa/TOKEN/settemp">'
     '<input type="number" name="void" id="slider-1" min="45" max="104" '
     'step="1" value="{sp}">'
-    '<input type="hidden" name="temp" id="slider-F" value="{sp}">'
     "</form>"
 )
+OFFLINE_PAGE = "<html><body>Spa control</body></html>"  # renders, no temperature
 
 
 class FakeResp:
-    status = 200
-
-    def __init__(self, body=""):
+    def __init__(self, body="", status=200):
         self._body = body
+        self.status = status
 
     async def __aenter__(self):
         return self
@@ -204,106 +101,230 @@ class FakeResp:
 
 
 class FakeHTTP:
-    """Counts what actually goes over the wire, and echoes a page back."""
+    """Counts what goes over the wire and controls what comes back.
 
-    def __init__(self, echo=True):
+    ``reports`` is what the spa's page will claim its setpoint is: an int, the
+    string "offline" for a page with no temperature on it at all, or a list to
+    play out one answer per read.
+    """
+
+    def __init__(self, reports=None):
         self.gets = 0
         self.posts = 0
-        self.echo = echo
-        self.last_sent = None
+        self.sent = None
+        self.reports = reports
+
+    def _page(self):
+        value = self.reports
+        if isinstance(value, list):
+            value = value.pop(0) if len(value) > 1 else value[0]
+        if value == "offline":
+            return OFFLINE_PAGE
+        if value is None:
+            value = self.sent if self.sent is not None else 85
+        return APP_PAGE.format(sp=value)
 
     def get(self, url):
         self.gets += 1
-        sp = self.last_sent if self.last_sent is not None else 85
-        return FakeResp(APP_PAGE.format(sp=sp) if self.echo else "")
+        return FakeResp(self._page())
 
     def post(self, url, data=None):
         self.posts += 1
-        self.last_sent = int(data["temp"])
-        return FakeResp(APP_PAGE.format(sp=self.last_sent) if self.echo else "")
+        self.sent = int(data["temp"])
+        return FakeResp(self._page())
 
 
-def simulate_day():
-    """Run 24 hourly enforcements exactly as the schedule automation does."""
+# --- fake WebSocket ----------------------------------------------------------
+class FakeWS:
+    def __init__(self, frames):
+        self.frames = list(frames)
+        self.sent = []
+
+    async def receive(self):
+        if self.frames:
+            return types.SimpleNamespace(type=1, data=self.frames.pop(0))
+        await asyncio.sleep(3600)  # silence; the listen window expires
+
+    async def send_str(self, text):
+        self.sent.append(text)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeSession:
+    def __init__(self, ws):
+        self.ws = ws
+        self.connects = 0
+
+    def ws_connect(self, url, heartbeat=None):
+        self.connects += 1
+        return self.ws
+
+
+def with_socket(frames):
+    """Point the coordinator at a fake socket, and hand back the fake."""
+    ws = FakeWS(frames)
+    session = FakeSession(ws)
+    coord.async_get_clientsession = lambda hass: session
+    return ws, session
+
+
+def new_conn(http=None, frames=()):
     conn = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
-    http = FakeHTTP()
-    conn._http = http
-    for hour in range(24):
-        NOW[0] = datetime(2026, 9, 6, hour, 0, tzinfo=timezone.utc)
-        conn._handle_message(FRAME)  # the spa keeps reporting all day
-        want = 103 if hour in (15, 16, 17) else 85
-        asyncio.run(conn.async_set_temperature(want))
-    return http, conn
+    conn._http = http if http is not None else FakeHTTP()
+    with_socket(frames)
+    return conn
 
 
-print("\n=== one day of the hourly schedule ===")
-NOW[0] = datetime(2026, 9, 6, 0, 0, tzinfo=timezone.utc)
-http, conn = simulate_day()
-before = 24 * 2  # every hour did a GET /app plus a POST
-after = http.gets + http.posts
-print(f"  GET /app (session mints): {http.gets}   was 24")
-print(f"  POST settemp:             {http.posts}   was 24")
-print(f"  total requests:           {after}   was {before}"
-      f"   ({100 - round(100 * after / before)}% fewer)")
-check("setpoint still ends correct", conn._setpoint, 85)
-check("session mints under 24", http.gets < 24, True)
-check("both schedule transitions sent", http.posts >= 2, True)
+# =============================================================================
+print("=== the setpoint job: confirmed against the spa's own page ===")
+http = FakeHTTP()
+c = new_conn(http)
+run(c.async_apply_setpoint(103))
+check("job recorded ok", c.jobs[JOB_SETPOINT].ok, True)
+check("spa's value reported back", c.reported_setpoint, 103)
+check("nothing is failing", c.failing, [])
+check("confirmed_at stamped", c.setpoint_confirmed_at is not None, True)
 
-print("\nan outage must clear the dedupe so recovery re-asserts:")
-NOW[0] += timedelta(seconds=STALE_AFTER_SECONDS + 1)
-conn._async_check_staleness(NOW[0])
-check("available", conn.available, False)
-check("remembered setpoint cleared", conn._setpoint, None)
-conn._handle_message(FRAME)
-asyncio.run(conn.async_set_temperature(85))
-check("re-asserted after recovery", conn._setpoint, 85)
+print("\nthe spa keeps a different value — the write did not land:")
+c = new_conn(FakeHTTP(reports=85))
+try:
+    run(c.async_apply_setpoint(103))
+    check("raised", False, True)
+except HomeAssistantError as err:
+    check("raised", True, True)
+    check("says both numbers", "103" in str(err) and "85" in str(err), True)
+check("job recorded failed", c.jobs[JOB_SETPOINT].ok, False)
+check("failing names the job", c.failing, [JOB_SETPOINT])
+
+print("\nthe page renders with no temperature — the WF-100 signature:")
+print("  (this is the two-day outage: 200 OK, a page, and nothing behind it)")
+c = new_conn(FakeHTTP(reports="offline"))
+try:
+    run(c.async_apply_setpoint(103))
+    check("raised", False, True)
+except HomeAssistantError as err:
+    check("raised", True, True)
+    check("names the real cause", "off the cloud" in str(err), True)
+check("job recorded failed", c.jobs[JOB_SETPOINT].ok, False)
+
+print("\na spa that takes a moment to settle still confirms:")
+c = new_conn(FakeHTTP(reports=[85, 85, 103]))
+run(c.async_apply_setpoint(103))
+check("confirmed on a later read", c.jobs[JOB_SETPOINT].ok, True)
+check("reported", c.reported_setpoint, 103)
+
+print("\nrecovery clears the alarm — failing is the LAST run, not ever:")
+c = new_conn(FakeHTTP(reports=85))
+try:
+    run(c.async_apply_setpoint(103))
+except HomeAssistantError:
+    pass
+check("failing", c.failing, [JOB_SETPOINT])
+c._http = FakeHTTP()
+run(c.async_apply_setpoint(103))
+check("failing after a good run", c.failing, [])
 
 
+# =============================================================================
+print("\n=== the clock job: delivery, honestly labelled ===")
+c = new_conn(frames=['{"stsR":1}'])
+run(c.async_sync_clock(datetime(2026, 9, 8, 15, 21)))
+check("job recorded ok", c.jobs[JOB_CLOCK].ok, True)
+ws, _ = with_socket(['{"stsR":1}'])
+c2 = new_conn(frames=[])
+coord.async_get_clientsession = lambda hass: FakeSession(ws)
+run(c2.async_sync_clock(datetime(2026, 9, 8, 15, 21)))
+check("sent the right frame", ws.sent, ['{"time": "0321P"}'])
 
-# --- setpoint readback -------------------------------------------------------
-from spa_websocket.coordinator import parse_setpoint  # noqa: E402
-from spa_websocket.decode import decode_temperature, plausible  # noqa: E402
+print("\nmidnight and noon are the edge cases that break 12-hour clocks:")
+for hour, minute, want in [(0, 0, "1200A"), (12, 0, "1200P"), (13, 5, "0105P")]:
+    ws, _ = with_socket([])
+    c3 = new_conn()
+    coord.async_get_clientsession = lambda hass, _ws=ws: FakeSession(_ws)
+    run(c3.async_sync_clock(datetime(2026, 9, 8, hour, minute)))
+    check(f"{hour:02d}:{minute:02d}", ws.sent[0], '{"time": "%s"}' % want)
 
-print("\n=== setpoint readback off the app page ===")
+print("\nthe relay says it has lost the spa — do not pretend the clock was set:")
+c = new_conn(frames=['{"stsR":0}'])
+try:
+    run(c.async_sync_clock(datetime(2026, 9, 8, 4, 0)))
+    check("raised", False, True)
+except HomeAssistantError as err:
+    check("raised", True, True)
+    check("says why", "accepted and discarded" in str(err), True)
+check("job recorded failed", c.jobs[JOB_CLOCK].ok, False)
+check("failing names the job", c.failing, [JOB_CLOCK])
+
+
+# =============================================================================
+print("\n=== readings keep their value and carry their age ===")
+c = new_conn(frames=[FRAME])
+run(c.async_refresh())
+check("temperature", c.temperature, 91)
+check("heating", c.heating, True)
+check("measured_at stamped", c.measured_at, NOW[0])
+
+print("\nsilence is not a fault — frames are bursty, gaps reach 33 minutes:")
+c = new_conn(frames=[])
+c.temperature, c.measured_at = 91, NOW[0]
+run(c.async_refresh())          # must not raise
+check("keeps the old reading", c.temperature, 91)
+check("keeps the old timestamp", c.measured_at, NOW[0])
+
+print("\nthe filtering bit, for verifying the clock later:")
+c = new_conn(frames=[FILTER_FRAME])
+run(c.async_refresh())
+check("filtering", c.filtering, True)
+c = new_conn(frames=[FRAME])
+run(c.async_refresh())
+check("not filtering", c.filtering, False)
+
+print("\na display frame outranks a stale offline verdict:")
+c = new_conn()
+c._handle_message('{"stsR":0}')
+check("relay says offline", c.relay_linked, False)
+c._handle_message(FRAME)
+check("frame proves otherwise", c.relay_linked, True)
+
+
+# =============================================================================
+print("\n=== what a day now costs the relay ===")
+http = FakeHTTP()
+c = new_conn(http)
+run(c.async_apply_setpoint(103))    # 15:00 here / noon spa-local
+run(c.async_apply_setpoint(85))     # 18:00 here / 3pm spa-local
+_, session = with_socket([])
+coord.async_get_clientsession = lambda hass: session
+run(c.async_sync_clock(datetime(2026, 9, 8, 4, 0)))
+print(f"  HTTP requests: {http.gets + http.posts}   (was 48 hourly, then 10)")
+print("  socket:        3 short visits   (was open 24h with a 20s heartbeat)")
+check("two setpoint writes", http.posts, 2)
+check("both confirmed", [j.ok for j in c.jobs.values()], [True, True])
+
+
+# =============================================================================
+print("\n=== setpoint parsing ===")
 check("parses the rendered form", parse_setpoint(APP_PAGE.format(sp=103)), 103)
 check("attribute order independent",
       parse_setpoint('<input value="99" name="void" type="number">'), 99)
-check("no form -> None", parse_setpoint("<html>nothing here</html>"), None)
+check("a page with no setpoint -> None", parse_setpoint(OFFLINE_PAGE), None)
 
-NOW[0] = datetime(2026, 9, 7, 15, 0, tzinfo=timezone.utc)
-c3 = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
-c3._http = FakeHTTP()
-c3._handle_message(FRAME)
-asyncio.run(c3.async_set_temperature(103))
-check("reports the spa's value, not ours", c3.reported_setpoint, 103)
-
-print("\na page that does not echo must not invent a reading:")
-c4 = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
-c4._http = FakeHTTP(echo=False)
-c4._handle_message(FRAME)
-asyncio.run(c4.async_set_temperature(103))
-check("reported_setpoint stays None", c4.reported_setpoint, None)
-
-print("\nan outage clears the readback too (it is stale, not truth):")
-NOW[0] += timedelta(seconds=STALE_AFTER_SECONDS + 1)
-c3._async_check_staleness(NOW[0])
-check("cleared", c3.reported_setpoint, None)
-
-
-# --- decoder plausibility ----------------------------------------------------
 print("\n=== decoder rejects what cannot be spa water ===")
 for value, unit, want in [
     (92, "F", True), (40, "F", True), (115, "F", True),
-    (19, "F", False), (194, "F", False), (195, "F", False),
-    (592, "F", False), (599, "F", False), (992, "F", False),
-    (38, "C", True), (46, "C", True), (99, "C", False),
+    (19, "F", False), (194, "F", False), (592, "F", False), (992, "F", False),
+    (38, "C", True), (99, "C", False),
 ]:
     check(f"{value}{unit} plausible", plausible(value, unit), want)
 
 print("\nreal frames still decode:")
 check("upright 92F", decode_temperature("f15b6f000500"), (92, "F"))
 check("flipped 96F", decode_temperature("007d6fce1400"), (96, "F"))
-check("flipped 91F", decode_temperature("007d30ce0500"), (91, "F"))
 check("ECon is not a temperature", decode_temperature("4f0f63620000"), None)
 
 print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))

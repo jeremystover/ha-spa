@@ -35,8 +35,6 @@ SET_TIME_SCHEMA = vol.Schema({vol.Optional(ATTR_TIMEZONE): cv.string})
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Spa WebSocket from a config entry."""
     connection = SpaConnection(hass, entry.data[CONF_URL])
-    await connection.start()
-
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = connection
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -44,7 +42,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Send one raw command code to every configured spa."""
         code = call.data[ATTR_CODE]
         for conn in hass.data[DOMAIN].values():
-            await conn.send(code)
+            await conn.async_press(code)
 
     async def handle_set_time(call: ServiceCall) -> None:
         """Set every configured spa's clock to the current wall time."""
@@ -56,7 +54,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         now = dt_util.now().astimezone(tz)
         for conn in hass.data[DOMAIN].values():
-            await conn.async_set_time(now)
+            await conn.async_sync_clock(now)
 
     hass.services.async_register(
         DOMAIN, SERVICE_SEND_RAW, handle_send_raw, schema=SEND_RAW_SCHEMA
@@ -71,8 +69,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        connection: SpaConnection = hass.data[DOMAIN].pop(entry.entry_id)
-        await connection.stop()
+        hass.data[DOMAIN].pop(entry.entry_id)
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, SERVICE_SEND_RAW)
             hass.services.async_remove(DOMAIN, SERVICE_SET_TIME)

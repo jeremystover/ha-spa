@@ -1,9 +1,18 @@
-"""Shared WebSocket connection to the spa.
+"""Short, deliberate visits to the spa — no standing connection.
 
-One connection is opened per config entry and shared by every entity, mirroring
-the original Homebridge plugin's protocol: single-character commands are sent to
-toggle jets/filter, and incoming ``{"dsp": "<hex>"}`` messages report the jets
-state.
+The integration used to hold a WebSocket open all day, ping it every twenty
+seconds, and re-assert the setpoint every hour. That bought a live temperature
+reading and a fast offline signal, and it made the interesting question harder
+to answer rather than easier: *did the thing I needed actually happen?*
+
+What matters is three events a day. The clock is set once, at 04:00 spa-local
+when nothing else is going on. The setpoint goes up for the afternoon window and
+back down after it. Each one is verified against the spa's own account of itself,
+and a failure to verify is the only thing worth an alarm.
+
+So this connects when it has something to do, confirms it, and hangs up. Between
+visits the readings keep their last value and say when they were taken, which is
+honest: a reading from this morning is still the truth about this morning.
 """
 
 from __future__ import annotations
@@ -13,7 +22,8 @@ import json
 import logging
 import re
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime
 
 import aiohttp
 
@@ -23,25 +33,26 @@ from homeassistant.helpers.aiohttp_client import (
     async_create_clientsession,
     async_get_clientsession,
 )
-from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONFIRM_ATTEMPTS,
+    CONFIRM_DELAY_SECONDS,
     DSP_FLAG_TO_STATE,
     FLAG_EDIT,
+    FLAG_FILTERING,
     FLAG_HEATING,
     HEARTBEAT,
+    JOB_CLOCK,
+    JOB_SETPOINT,
     KEY_RELAY_STATUS,
     PATH_APP,
     PATH_SETTEMP,
-    RECONNECT_DELAY,
-    RELINK_PROBE_SECONDS,
-    SESSION_MAX_AGE_SECONDS,
-    SETPOINT_REASSERT_SECONDS,
-    STALE_AFTER_SECONDS,
-    STALENESS_TICK_SECONDS,
+    REFRESH_SECONDS,
+    RELAY_ANSWER_SECONDS,
     STATE_NAMES,
     STATE_OFF,
+    VISIT_SECONDS,
 )
 from .decode import decode_temperature
 
@@ -59,8 +70,9 @@ def parse_setpoint(html: str) -> int | None:
 
     This is the only way to learn what the spa actually has, as opposed to what
     was last sent to it. The distinction is not academic: a relay that has lost
-    the spa answers every write with 200, so without a readback a setpoint that
-    went nowhere is indistinguishable from one that landed.
+    the spa keeps answering 200 and keeps rendering a page, but that page comes
+    back without a temperature. So None is not "parse failed" — it is the
+    signature of a spa that is not there.
     """
     if (tag := _SETPOINT_INPUT.search(html)) is None:
         return None
@@ -69,220 +81,61 @@ def parse_setpoint(html: str) -> int | None:
     return int(value.group(1))
 
 
+@dataclass(frozen=True)
+class JobResult:
+    """How a scheduled job went, and what it saw."""
+
+    ok: bool
+    at: datetime
+    detail: str
+
+
 class SpaConnection:
-    """Maintains a single reconnecting WebSocket connection to the spa."""
+    """Talks to one spa in short visits, and remembers what it was told."""
 
     def __init__(self, hass: HomeAssistant, url: str) -> None:
         """Initialize the connection."""
         self.hass = hass
         self.url = url
-        self.jets_state: int = STATE_OFF
-        # Most recent raw frame, surfaced as a diagnostic attribute so the
-        # protocol can be inspected without turning on debug logging.
-        self.last_frame: str | None = None
-        # Last successfully decoded display reading. The panel cycles through
-        # states the decoder does not read as a temperature, so the last good
-        # value is kept rather than flapping to unknown between frames.
+
+        # Last known readings. None of this expires. An hours-old temperature is
+        # not wrong, it is old, and `measured_at` is what says so -- whereas
+        # blanking it out would throw away the only reading there is.
         self.temperature: int | None = None
         self.temperature_unit: str | None = None
-        # Whether the heater is currently running. This spa heats on demand
-        # whenever the water is below setpoint, independent of the filter
-        # cycles, so it is the fastest available signal that a setpoint we sent
-        # actually took effect.
+        self.measured_at: datetime | None = None
         self.heating: bool = False
-        # When the last display frame arrived, and whether the relay says it has
-        # a live link to the spa. Both feed `available` -- see that property for
-        # why a dead link is otherwise completely silent.
-        self.last_frame_at: datetime | None = None
-        # When the socket last opened. Distinct from last_frame_at because a
-        # fresh connection that has not spoken yet is not the same as one that
-        # has gone quiet -- see `available`.
-        self.connected_at: datetime | None = None
-        self.relay_linked: bool = True
-        # When the socket was last reopened purely to ask the relay again. See
-        # RELINK_PROBE_SECONDS: recovery is otherwise invisible for hours.
-        self._probed_at: datetime | None = None
-        # What was last written and when, and when the session cookie was last
-        # minted. Both exist to keep traffic down -- see async_set_temperature --
-        # and both are cleared whenever the spa stops reporting, so a recovery
-        # re-asserts rather than trusting state from before the gap.
-        self._setpoint: int | None = None
-        self._setpoint_at: datetime | None = None
-        self._session_at: datetime | None = None
-        # What the spa itself says its setpoint is, read back off the app page.
-        # Distinct from _setpoint, which is only what was last sent.
+        self.filtering: bool = False
+        self.jets_state: int = STATE_OFF
+
+        # What the spa says its setpoint is, read back off its own page. Never
+        # what we sent -- believing our own writes is what let two days of
+        # discarded setpoints look like success.
         self.reported_setpoint: int | None = None
-        self._ws: aiohttp.ClientWebSocketResponse | None = None
-        self._task: asyncio.Task | None = None
-        self._unsub_tick: Callable[[], None] | None = None
-        self._closing = False
+        self.setpoint_confirmed_at: datetime | None = None
+
+        # Whether the relay claimed a live link during the visit in progress.
+        # None until it says, because "has not said" is not "said no".
+        self.relay_linked: bool | None = None
+
+        # How each scheduled job last went. This is the alarm surface.
+        self.jobs: dict[str, JobResult] = {}
+
         self._listeners: list[Callable[[], None]] = []
         # Its own cookie jar: the settemp POST is authenticated by a session
         # cookie that must not leak into Home Assistant's shared session.
         self._http = async_create_clientsession(hass)
 
-    @property
-    def available(self) -> bool:
-        """Whether the spa is actually reporting right now.
-
-        Worth the machinery because the failure this catches is invisible
-        otherwise. When the spa's WiFi module drops off the cloud relay, the
-        relay stays up: the WebSocket connects, HTTP returns 200, and no
-        exception is raised anywhere. It just has nothing from the spa. Readings
-        freeze at their last value and setpoints are accepted and discarded.
-
-        Observed in the field: the setpoint was written on schedule for two days
-        while the water cooled from 99F to 83F, with every automation reporting
-        success and not one error in the log.
-
-        Silence is measured from the connection as well as from the last frame,
-        because those are different situations and only one of them is a fault.
-        Having heard nothing YET on a socket that just opened is no information;
-        having heard nothing for an hour on a socket that was working is a fault.
-        Without this every Home Assistant restart looked like an outage and
-        stayed that way until a frame happened to arrive -- which, given how
-        bursty they are, can be half an hour. It made restarts page people and
-        made setpoint writes refuse for no reason.
-
-        Granting that grace cannot hide the real failure: a relay that has lost
-        the spa says so in KEY_RELAY_STATUS on connect, and that is checked first.
-        """
-        if not self.relay_linked:
-            return False
-
-        heard_from = self.last_frame_at
-        if self.connected_at is not None and (
-            heard_from is None or self.connected_at > heard_from
-        ):
-            heard_from = self.connected_at
-        if heard_from is None:
-            return False
-
-        return (dt_util.utcnow() - heard_from).total_seconds() < STALE_AFTER_SECONDS
+    # ---- state other objects read -------------------------------------------
 
     @property
-    def _base_url(self) -> str:
-        """Return the HTTP base for this spa, derived from the socket URL.
-
-        ``wss://host/spa/<token>/wsb`` -> ``https://host/spa/<token>``
-        """
-        base = self.url.replace("wss://", "https://").replace("ws://", "http://")
-        return base.rsplit("/", 1)[0]
-
-    async def async_set_temperature(self, temperature: int) -> None:
-        """Set the spa's target temperature.
-
-        Temperature is not a WebSocket command. It is a form POST, authenticated
-        by a session cookie that the app page issues and that lasts about an
-        hour.
-
-        Deliberately frugal. Re-asserting hourly does not require re-sending
-        hourly: the value genuinely differs twice a day, and the rest restate
-        what the spa already has. Fetching the app page before each POST also
-        minted a fresh session every time, which is a lot of sessions to put
-        through a small third-party relay for no gain.
-
-        So an unchanged setpoint is not re-sent until it goes stale, and the
-        cookie is reused rather than re-minted. Both counters reset whenever the
-        spa stops reporting, so recovery from an outage still re-asserts
-        everything from scratch.
-        """
-        if not self.available:
-            raise HomeAssistantError(
-                f"Spa is not reporting, so setpoint {temperature} was not sent. "
-                "The relay accepts and acknowledges commands even when the spa "
-                "is offline, so sending anyway would look like success and "
-                "change nothing."
-            )
-
-        now = dt_util.utcnow()
-        if (
-            self._setpoint == temperature
-            and self._setpoint_at is not None
-            and (now - self._setpoint_at).total_seconds() < SETPOINT_REASSERT_SECONDS
-        ):
-            _LOGGER.debug("Spa setpoint already %s, not re-sending", temperature)
-            return
-
-        base = self._base_url
-        payload = {
-            "flip-scale": "0",
-            "void": str(temperature),
-            "temp": str(temperature),
-        }
-
-        try:
-            if (
-                self._session_at is None
-                or (now - self._session_at).total_seconds() >= SESSION_MAX_AGE_SECONDS
-            ):
-                async with self._http.get(f"{base}/{PATH_APP}") as page:
-                    self._read_setpoint(await page.text())
-                self._session_at = now
-            async with self._http.post(
-                f"{base}/{PATH_SETTEMP}", data=payload
-            ) as resp:
-                if resp.status != 200:
-                    raise HomeAssistantError(
-                        f"Spa rejected setpoint {temperature}: HTTP {resp.status}"
-                    )
-                # The form POST renders the page back, so the spa's own view of
-                # the setpoint arrives here for free.
-                self._read_setpoint(await resp.text(), expected=temperature)
-        except aiohttp.ClientError as err:
-            raise HomeAssistantError(f"Could not reach the spa: {err}") from err
-
-        self._setpoint = temperature
-        self._setpoint_at = now
-        _LOGGER.info("Spa target temperature set to %s", temperature)
-
-    @callback
-    def _read_setpoint(self, html: str, expected: int | None = None) -> None:
-        """Record the setpoint the spa reports, and flag it if it disagrees.
-
-        Deliberately does not raise on a mismatch. Whether this endpoint echoes
-        the new value or the pre-write one has not been established against the
-        hardware, and guessing wrong would fail every legitimate write. A warning
-        plus a reported value that is the spa's rather than ours is enough to see
-        the problem; tighten it once the echo semantics are confirmed.
-        """
-        reported = parse_setpoint(html)
-        if reported is None:
-            return
-        self.reported_setpoint = reported
-        if expected is not None and reported != expected:
-            _LOGGER.warning(
-                "Spa reports setpoint %s after being sent %s — the write may not "
-                "have landed",
-                reported,
-                expected,
-            )
-        self._notify_listeners()
-
-    async def async_set_time(self, when: datetime) -> None:
-        """Set the spa's clock to ``when``.
-
-        The panel keeps a 12-hour clock and takes it as four digits plus an A or
-        P suffix -- 3:21pm is ``0321P`` -- wrapped in a JSON frame on the same
-        socket the buttons use. Captured from the iOS app, which reaches a
-        sibling endpoint on the same relay.
-
-        This matters because the filter cycles are programmed against that clock
-        and it does not survive a power cut, so after an outage the spa filters
-        at the wrong times. Heating is not affected -- this spa heats on demand
-        rather than only during filter cycles -- but filtration still drifts.
-
-        The clock cannot be read back -- the display multiplexes to the water
-        temperature at idle -- so it is re-asserted on a schedule rather than
-        checked and corrected. Writing the correct time to an already-correct
-        clock changes nothing, which is what makes that safe.
-        """
-        meridiem = "A" if when.hour < 12 else "P"
-        await self.send(json.dumps({"time": f"{when:%I%M}{meridiem}"}))
+    def failing(self) -> list[str]:
+        """Names of the jobs whose most recent run did not confirm."""
+        return sorted(name for name, job in self.jobs.items() if not job.ok)
 
     @callback
     def add_listener(self, update_callback: Callable[[], None]) -> Callable[[], None]:
-        """Register an entity to be notified when the jets state changes."""
+        """Register an entity to be notified when anything changes."""
         self._listeners.append(update_callback)
 
         def _remove() -> None:
@@ -295,207 +148,261 @@ class SpaConnection:
         for update_callback in self._listeners:
             update_callback()
 
-    async def start(self) -> None:
-        """Start the background connection loop."""
-        self._closing = False
-        self._task = self.hass.async_create_background_task(
-            self._run(), name=f"spa_websocket {self.url}"
-        )
-        # Availability is a function of elapsed time, so once frames stop there
-        # is no incoming event left to recompute it. Without this tick the
-        # entities would sit on stale values forever, which is the exact bug.
-        self._unsub_tick = async_track_time_interval(
-            self.hass,
-            self._async_check_staleness,
-            timedelta(seconds=STALENESS_TICK_SECONDS),
-        )
-
-    async def stop(self) -> None:
-        """Stop the connection loop and close the socket."""
-        self._closing = True
-        if self._unsub_tick is not None:
-            self._unsub_tick()
-            self._unsub_tick = None
-        if self._ws is not None:
-            await self._ws.close()
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-
-    async def send(self, code: str) -> None:
-        """Send a command code to the spa."""
-        if self._ws is None or self._ws.closed:
-            _LOGGER.warning("WebSocket not open, cannot send %r", code)
-            return
-        _LOGGER.debug("Sending %r to spa", code)
-        await self._ws.send_str(code)
-
-    async def _run(self) -> None:
-        """Connect, read messages, and reconnect forever until stopped."""
-        session = async_get_clientsession(self.hass)
-        while not self._closing:
-            try:
-                async with session.ws_connect(self.url, heartbeat=HEARTBEAT) as ws:
-                    self._ws = ws
-                    self.connected_at = dt_util.utcnow()
-                    _LOGGER.info("Spa WebSocket connected to %s", self.url)
-                    async for msg in ws:
-                        if msg.type in (
-                            aiohttp.WSMsgType.TEXT,
-                            aiohttp.WSMsgType.BINARY,
-                        ):
-                            self._handle_message(msg.data)
-                        elif msg.type in (
-                            aiohttp.WSMsgType.CLOSED,
-                            aiohttp.WSMsgType.ERROR,
-                        ):
-                            break
-            except asyncio.CancelledError:
-                raise
-            except (aiohttp.ClientError, OSError) as err:
-                _LOGGER.warning("Spa WebSocket error: %s", err)
-            finally:
-                self._ws = None
-
-            if self._closing:
-                break
-            _LOGGER.info("Spa WebSocket closed, reconnecting in %ss", RECONNECT_DELAY)
-            await asyncio.sleep(RECONNECT_DELAY)
-
-    def _probe_due(self, now: datetime) -> bool:
-        """Whether to reopen the socket to get a current answer from the relay.
-
-        Only while something is wrong, and only on an interval: a healthy
-        connection is never disturbed, and an outage costs one handshake every
-        RELINK_PROBE_SECONDS rather than a reconnect storm.
-        """
-        if self.available:
-            return False
-        if self._probed_at is not None and (
-            now - self._probed_at
-        ).total_seconds() < RELINK_PROBE_SECONDS:
-            return False
-        return True
-
     @callback
-    def _async_force_reconnect(self) -> None:
-        """Close the socket so the run loop dials again.
-
-        Closing is the whole mechanism: ``_run`` reconnects on its own after
-        RECONNECT_DELAY, and the relay states its link on the new connection.
-        """
-        ws = self._ws
-        if ws is None or ws.closed:
-            return
-        _LOGGER.info(
-            "Spa still not reporting — reopening the socket to ask the relay again"
-        )
-        self.hass.async_create_task(ws.close())
-
-    @callback
-    def _async_check_staleness(self, now: datetime) -> None:
-        """Re-publish entity state so availability reflects elapsed time."""
-        if not self.available:
-            # Nothing learned before the gap can be trusted across it: the spa
-            # may have been power-cycled, or writes may have been landing
-            # nowhere. Forget both so recovery re-asserts the setpoint and mints
-            # a fresh session instead of assuming either survived.
-            self._setpoint = None
-            self._setpoint_at = None
-            self._session_at = None
-            self.reported_setpoint = None
-            if self._probe_due(now):
-                self._probed_at = now
-                self._async_force_reconnect()
+    def _record(self, job: str, ok: bool, detail: str) -> None:
+        """Record how a job went and tell the entities."""
+        self.jobs[job] = JobResult(ok=ok, at=dt_util.utcnow(), detail=detail)
+        if ok:
+            _LOGGER.info("Spa %s job confirmed: %s", job, detail)
+        else:
+            _LOGGER.error("Spa %s job did NOT confirm: %s", job, detail)
         self._notify_listeners()
 
-    @callback
-    def _handle_message(self, raw: str | bytes) -> None:
-        """Parse an incoming message and update the jets state."""
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8", errors="ignore")
+    @property
+    def _base_url(self) -> str:
+        """Return the HTTP base for this spa, derived from the socket URL.
 
-        _LOGGER.debug("Spa frame received: %s", raw[:200])
+        ``wss://host/spa/<token>/wsb`` -> ``https://host/spa/<token>``
+        """
+        base = self.url.replace("wss://", "https://").replace("ws://", "http://")
+        return base.rsplit("/", 1)[0]
 
-        # Record every frame, including shapes this integration does not parse
-        # yet — the spa's protocol is undocumented and the unparsed frames are
-        # where the temperature readout is expected to live.
-        changed = raw != self.last_frame
-        self.last_frame = raw
+    # ---- the socket, opened only when there is something to do ---------------
+
+    async def _listen(
+        self, ws: aiohttp.ClientWebSocketResponse, seconds: float
+    ) -> bool:
+        """Read frames for up to ``seconds``, returning once the spa speaks.
+
+        Best effort by design. Display frames are bursty -- gaps of ten to
+        thirty minutes are normal on a perfectly healthy spa -- so a visit can
+        easily end without one arriving. That is not a fault and must never be
+        reported as one: the confirmations that matter go over HTTP. A frame
+        caught here is a bonus reading, nothing more.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
+        while (remaining := deadline - loop.time()) > 0:
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=remaining)
+            except TimeoutError:
+                return False
+            if msg.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
+                if self._handle_message(msg.data):
+                    return True
+            elif msg.type in (
+                aiohttp.WSMsgType.CLOSE,
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.CLOSING,
+                aiohttp.WSMsgType.ERROR,
+            ):
+                return False
+        return False
+
+    async def _visit(self, send: str | None = None, listen: float | None = None) -> bool:
+        """Open the socket, optionally send one frame, listen briefly, hang up.
+
+        The relay states its link on connect, promptly and reliably, so opening
+        a socket is also how we ask whether the spa is there at all.
+        """
+        listen = VISIT_SECONDS if listen is None else listen
+        self.relay_linked = None
+        session = async_get_clientsession(self.hass)
+        async with session.ws_connect(self.url, heartbeat=HEARTBEAT) as ws:
+            # Give the relay its moment to volunteer stsR before acting on it.
+            await self._listen(ws, RELAY_ANSWER_SECONDS)
+            if send is not None:
+                if self.relay_linked is False:
+                    raise HomeAssistantError(
+                        "the relay reports no link to the spa, so the command "
+                        "would have been accepted and discarded"
+                    )
+                await ws.send_str(send)
+            spoke = await self._listen(ws, listen)
+        self._notify_listeners()
+        return spoke
+
+    # ---- the three jobs ------------------------------------------------------
+
+    async def async_apply_setpoint(self, temperature: int) -> None:
+        """Set the target temperature and confirm the spa took it.
+
+        Confirmation is a *fresh* page load, not the POST's own echo. Whether
+        that echo carries the new value or the pre-write one was never
+        established against the hardware, so trusting it would be guessing; a
+        page fetched a few seconds later is the spa's settled answer.
+
+        Raises when it cannot be confirmed, which is the point of the exercise.
+        """
+        base = self._base_url
+        payload = {
+            "flip-scale": "0",
+            "void": str(temperature),
+            "temp": str(temperature),
+        }
 
         try:
+            # The app page is what issues the session cookie the POST needs.
+            async with self._http.get(f"{base}/{PATH_APP}") as page:
+                if page.status != 200:
+                    raise HomeAssistantError(f"app page returned {page.status}")
+                await page.text()
+            async with self._http.post(f"{base}/{PATH_SETTEMP}", data=payload) as resp:
+                if resp.status != 200:
+                    raise HomeAssistantError(f"settemp returned {resp.status}")
+                await resp.text()
+            reported = await self._read_back(temperature)
+        except (aiohttp.ClientError, TimeoutError) as err:
+            detail = f"could not reach the spa to set {temperature}F: {err}"
+            self._record(JOB_SETPOINT, False, detail)
+            raise HomeAssistantError(detail) from err
+        except HomeAssistantError as err:
+            detail = f"setting {temperature}F failed: {err}"
+            self._record(JOB_SETPOINT, False, detail)
+            raise HomeAssistantError(detail) from err
+
+        if reported is None:
+            detail = (
+                f"sent {temperature}F, but the spa's page came back with no "
+                "setpoint at all — that is what the relay renders when the "
+                "WF-100 is off the cloud"
+            )
+            self._record(JOB_SETPOINT, False, detail)
+            raise HomeAssistantError(detail)
+
+        if reported != temperature:
+            detail = f"sent {temperature}F, but the spa still reports {reported}F"
+            self._record(JOB_SETPOINT, False, detail)
+            raise HomeAssistantError(detail)
+
+        self._record(JOB_SETPOINT, True, f"spa confirms {reported}F")
+
+        # Opportunistic, and never allowed to fail the job: while we are here,
+        # see whether the panel has anything to say.
+        try:
+            await self._visit()
+        except (aiohttp.ClientError, OSError, TimeoutError) as err:
+            _LOGGER.debug("No reading taken after the setpoint change: %s", err)
+
+    async def _read_back(self, expected: int) -> int | None:
+        """Return the spa's own setpoint, retrying while it settles."""
+        reported = None
+        for _ in range(CONFIRM_ATTEMPTS):
+            await asyncio.sleep(CONFIRM_DELAY_SECONDS)
+            async with self._http.get(f"{self._base_url}/{PATH_APP}") as page:
+                if page.status != 200:
+                    raise HomeAssistantError(f"app page returned {page.status}")
+                reported = parse_setpoint(await page.text())
+            self.reported_setpoint = reported
+            if reported == expected:
+                self.setpoint_confirmed_at = dt_util.utcnow()
+                self._notify_listeners()
+                return reported
+        self._notify_listeners()
+        return reported
+
+    async def async_sync_clock(self, when: datetime) -> None:
+        """Set the spa's clock, and record whether it could be delivered.
+
+        The panel takes a 12-hour clock as four digits plus an A or P -- 3:21pm
+        is ``0321P`` -- on the same socket the buttons use.
+
+        **This cannot be confirmed.** The clock cannot be read back: the display
+        multiplexes between water temperature and setpoint, never the time. So
+        what is recorded here is delivery, not correctness — the socket opened,
+        the relay did not say it had lost the spa, and the frame went out. That
+        is weaker than the setpoint's confirmation and is labelled as such.
+
+        The filter cycle is the way to close this gap later: FP1 runs noon to
+        3pm spa-local, so a filtering bit that comes on at noon is a clock that
+        is right. `binary_sensor` exposes that bit; nothing acts on it yet.
+        """
+        meridiem = "A" if when.hour < 12 else "P"
+        frame = json.dumps({"time": f"{when:%I%M}{meridiem}"})
+        try:
+            await self._visit(send=frame)
+        except (aiohttp.ClientError, OSError, TimeoutError) as err:
+            detail = f"could not reach the spa to set the clock: {err}"
+            self._record(JOB_CLOCK, False, detail)
+            raise HomeAssistantError(detail) from err
+        except HomeAssistantError as err:
+            detail = f"clock not set: {err}"
+            self._record(JOB_CLOCK, False, detail)
+            raise HomeAssistantError(detail) from err
+
+        self._record(
+            JOB_CLOCK, True, f"clock frame delivered ({when:%-I:%M %p} spa-local)"
+        )
+
+    async def async_refresh(self) -> None:
+        """Take a reading now, on demand.
+
+        May come back with nothing: frames arrive in bursts and a quiet spa can
+        easily say nothing for half an hour. The reading's timestamp is what
+        tells you whether it worked, so this never raises on silence.
+        """
+        try:
+            if not await self._visit(listen=REFRESH_SECONDS):
+                _LOGGER.info("Spa said nothing during the refresh window")
+        except (aiohttp.ClientError, OSError, TimeoutError) as err:
+            raise HomeAssistantError(f"Could not reach the spa: {err}") from err
+
+    async def async_press(self, code: str) -> None:
+        """Send one command code, opening a socket for it."""
+        try:
+            await self._visit(send=code, listen=REFRESH_SECONDS)
+        except (aiohttp.ClientError, OSError, TimeoutError) as err:
+            raise HomeAssistantError(f"Could not reach the spa: {err}") from err
+
+    # ---- decoding what arrives ----------------------------------------------
+
+    @callback
+    def _handle_message(self, raw: str | bytes) -> bool:
+        """Decode one frame. Returns True if it was a real display frame."""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "ignore")
+        try:
             parsed = json.loads(raw)
-        except (ValueError, TypeError):
-            parsed = None
+        except ValueError:
+            _LOGGER.debug("Ignoring non-JSON frame from spa: %r", raw)
+            return False
 
-        dsp = parsed.get("dsp") if isinstance(parsed, dict) else None
+        if not isinstance(parsed, dict):
+            return False
 
-        # The relay volunteers its own link state. A zero here is the relay
-        # saying it has nothing from the spa, which is exactly when it would
-        # otherwise go on silently accepting commands.
-        if isinstance(parsed, dict) and KEY_RELAY_STATUS in parsed:
-            linked = bool(parsed[KEY_RELAY_STATUS])
-            if linked != self.relay_linked:
-                _LOGGER.warning(
-                    "Spa relay reports the spa is %s",
-                    "reachable" if linked else "OFFLINE — commands will be lost",
-                )
-                self.relay_linked = linked
-                changed = True
-
-        # Ignore all-zero / too-short frames, matching the original plugin.
-        if isinstance(dsp, str) and len(dsp) >= 12 and dsp.strip("0") != "":
-            # Only a real display frame counts as the spa reporting. The relay
-            # keeps talking to us after the spa is gone, so its own chatter must
-            # not be mistaken for liveness.
-            self.last_frame_at = dt_util.utcnow()
-
-            # The converse also holds, and it is the second way out of a stale
-            # offline verdict. A display frame is the panel's own output; through
-            # the whole 6 September outage not one arrived. So the relay cannot
-            # be forwarding these from a spa it has lost, and a stsR that still
-            # says otherwise is simply out of date.
+        if KEY_RELAY_STATUS in parsed:
+            self.relay_linked = bool(parsed[KEY_RELAY_STATUS])
             if not self.relay_linked:
-                _LOGGER.warning(
-                    "Spa is reporting again — clearing the relay's stale offline "
-                    "verdict"
-                )
-                self.relay_linked = True
-                changed = True
+                _LOGGER.warning("Spa relay reports it has no link to the spa")
 
-            flags = int(dsp[8:10], 16)
+        dsp = parsed.get("dsp")
+        # Ignore all-zero / too-short frames, matching the original plugin.
+        if not isinstance(dsp, str) or len(dsp) < 12 or dsp.strip("0") == "":
+            return False
 
-            new_state = STATE_OFF
-            for flag, state in DSP_FLAG_TO_STATE:
-                if flags & flag:
-                    new_state = state
-                    break
-            if new_state != self.jets_state:
-                _LOGGER.info("Spa jets changed to: %s", STATE_NAMES[new_state])
-                self.jets_state = new_state
-                changed = True
+        # A display frame is the panel's own output, so it is proof of a live
+        # link whatever the relay last claimed.
+        self.relay_linked = True
+        flags = int(dsp[8:10], 16)
 
-            heating = bool(flags & FLAG_HEATING)
-            if heating != self.heating:
-                _LOGGER.info("Spa heater %s", "on" if heating else "off")
-                self.heating = heating
-                changed = True
+        self.jets_state = STATE_OFF
+        for flag, state in DSP_FLAG_TO_STATE:
+            if flags & flag:
+                self.jets_state = state
+                break
+        _LOGGER.debug("Spa jets: %s", STATE_NAMES[self.jets_state])
 
-            # While the edit LED is lit the panel is showing the set temperature
-            # rather than the water temperature, so that reading is not what the
-            # temperature sensor reports.
-            editing = bool(flags & FLAG_EDIT)
-            reading = decode_temperature(dsp)
-            if reading is not None and not editing and reading != (
-                self.temperature,
-                self.temperature_unit,
-            ):
-                self.temperature, self.temperature_unit = reading
-                _LOGGER.debug("Spa temperature: %s°%s", *reading)
-                changed = True
+        self.heating = bool(flags & FLAG_HEATING)
+        self.filtering = bool(flags & FLAG_FILTERING)
 
-        if changed:
-            self._notify_listeners()
+        # While the edit LED is lit the panel is showing the set temperature
+        # rather than the water temperature, so that reading is not what the
+        # temperature sensor reports.
+        editing = bool(flags & FLAG_EDIT)
+        reading = decode_temperature(dsp)
+        if reading is not None and not editing:
+            self.temperature, self.temperature_unit = reading
+            self.measured_at = dt_util.utcnow()
+            _LOGGER.debug("Spa temperature: %s°%s", *reading)
+
+        return True
