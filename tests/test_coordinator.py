@@ -45,7 +45,10 @@ _pkg.__path__ = [str(_HERE / "custom_components" / "spa_websocket")]
 sys.modules["spa_websocket"] = _pkg
 
 from spa_websocket.coordinator import SpaConnection  # noqa: E402
-from spa_websocket.const import STALE_AFTER_SECONDS  # noqa: E402
+from spa_websocket.const import (  # noqa: E402
+    RELINK_PROBE_SECONDS,
+    STALE_AFTER_SECONDS,
+)
 
 FRAME = '{"dsp":"007d30ce0500"}'
 fails = []
@@ -84,9 +87,15 @@ c._handle_message('{"stsR":0}')
 check("available", c.available, False)
 check("relay_linked", c.relay_linked, False)
 
-print("\nfresh frame revives it:")
+print("\na real display frame revives it on its own:")
+print("  (waiting for the relay to volunteer stsR:1 cost 2h07m on 6 September)")
 c._handle_message(FRAME)
-check("available (relay still says 0)", c.available, False)
+check("frame outranks a stale stsR:0", c.available, True)
+check("relay verdict cleared", c.relay_linked, True)
+
+print("\nand an explicit stsR:1 still works:")
+c._handle_message('{"stsR":0}')
+check("offline again", c.available, False)
 c._handle_message('{"stsR":1}')
 check("available (relay recovered)", c.available, True)
 
@@ -110,6 +119,58 @@ print("\nthe real-world case — relay up, spa gone, only stsR:0 arriving:")
 c2 = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
 c2._handle_message('{"stsR":0}')
 check("available", c2.available, False)
+
+
+# --- reopening the socket to ask the relay again ----------------------------
+class FakeWS:
+    """Records that the socket was closed, which is what forces a redial."""
+
+    def __init__(self):
+        self.closed = False
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
+        self.closed = True
+
+
+class FakeHass:
+    def __init__(self):
+        self.tasks = []
+
+    def async_create_task(self, coro):
+        self.tasks.append(coro)
+
+
+print("\nwhile offline, redial on an interval instead of waiting to be told:")
+print("  (the WF-100 came back in moments; we believed it offline for 2h07m)")
+hass, ws = FakeHass(), FakeWS()
+c5 = SpaConnection(hass, "wss://h/spa/TOKEN/wsb")
+c5._ws = ws
+NOW[0] = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+c5._handle_message('{"stsR":0}')
+check("offline", c5.available, False)
+c5._async_check_staleness(NOW[0])
+check("first tick redials", ws.close_calls, 1)
+
+ws.closed = False
+NOW[0] = datetime(2026, 9, 8, 0, 1, tzinfo=timezone.utc)
+c5._async_check_staleness(NOW[0])
+check("no redial storm a minute later", ws.close_calls, 1)
+
+ws.closed = False
+NOW[0] = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc) + timedelta(
+    seconds=RELINK_PROBE_SECONDS + 1)
+c5._async_check_staleness(NOW[0])
+check("redials once the interval passes", ws.close_calls, 2)
+
+print("\na healthy connection is never disturbed:")
+ws.closed = False
+c5._handle_message(FRAME)
+check("healthy again", c5.available, True)
+NOW[0] += timedelta(seconds=RELINK_PROBE_SECONDS + 1)
+c5._async_check_staleness(NOW[0])
+check("socket left alone", ws.close_calls, 2)
 
 
 

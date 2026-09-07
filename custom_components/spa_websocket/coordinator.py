@@ -35,6 +35,7 @@ from .const import (
     PATH_APP,
     PATH_SETTEMP,
     RECONNECT_DELAY,
+    RELINK_PROBE_SECONDS,
     SESSION_MAX_AGE_SECONDS,
     SETPOINT_REASSERT_SECONDS,
     STALE_AFTER_SECONDS,
@@ -98,6 +99,9 @@ class SpaConnection:
         # has gone quiet -- see `available`.
         self.connected_at: datetime | None = None
         self.relay_linked: bool = True
+        # When the socket was last reopened purely to ask the relay again. See
+        # RELINK_PROBE_SECONDS: recovery is otherwise invisible for hours.
+        self._probed_at: datetime | None = None
         # What was last written and when, and when the session cookie was last
         # minted. Both exist to keep traffic down -- see async_set_temperature --
         # and both are cleared whenever the spa stops reporting, so a recovery
@@ -361,8 +365,38 @@ class SpaConnection:
             _LOGGER.info("Spa WebSocket closed, reconnecting in %ss", RECONNECT_DELAY)
             await asyncio.sleep(RECONNECT_DELAY)
 
+    def _probe_due(self, now: datetime) -> bool:
+        """Whether to reopen the socket to get a current answer from the relay.
+
+        Only while something is wrong, and only on an interval: a healthy
+        connection is never disturbed, and an outage costs one handshake every
+        RELINK_PROBE_SECONDS rather than a reconnect storm.
+        """
+        if self.available:
+            return False
+        if self._probed_at is not None and (
+            now - self._probed_at
+        ).total_seconds() < RELINK_PROBE_SECONDS:
+            return False
+        return True
+
     @callback
-    def _async_check_staleness(self, _now: datetime) -> None:
+    def _async_force_reconnect(self) -> None:
+        """Close the socket so the run loop dials again.
+
+        Closing is the whole mechanism: ``_run`` reconnects on its own after
+        RECONNECT_DELAY, and the relay states its link on the new connection.
+        """
+        ws = self._ws
+        if ws is None or ws.closed:
+            return
+        _LOGGER.info(
+            "Spa still not reporting — reopening the socket to ask the relay again"
+        )
+        self.hass.async_create_task(ws.close())
+
+    @callback
+    def _async_check_staleness(self, now: datetime) -> None:
         """Re-publish entity state so availability reflects elapsed time."""
         if not self.available:
             # Nothing learned before the gap can be trusted across it: the spa
@@ -373,6 +407,9 @@ class SpaConnection:
             self._setpoint_at = None
             self._session_at = None
             self.reported_setpoint = None
+            if self._probe_due(now):
+                self._probed_at = now
+                self._async_force_reconnect()
         self._notify_listeners()
 
     @callback
@@ -415,6 +452,20 @@ class SpaConnection:
             # keeps talking to us after the spa is gone, so its own chatter must
             # not be mistaken for liveness.
             self.last_frame_at = dt_util.utcnow()
+
+            # The converse also holds, and it is the second way out of a stale
+            # offline verdict. A display frame is the panel's own output; through
+            # the whole 6 September outage not one arrived. So the relay cannot
+            # be forwarding these from a spa it has lost, and a stsR that still
+            # says otherwise is simply out of date.
+            if not self.relay_linked:
+                _LOGGER.warning(
+                    "Spa is reporting again — clearing the relay's stale offline "
+                    "verdict"
+                )
+                self.relay_linked = True
+                changed = True
+
             flags = int(dsp[8:10], 16)
 
             new_state = STATE_OFF

@@ -72,6 +72,20 @@ STALENESS_TICK_SECONDS = 60
 # no live link, which is the state that produces silent command loss.
 KEY_RELAY_STATUS = "stsR"
 
+# How often to reopen the socket while the spa looks offline.
+#
+# The relay states its link ON CONNECT, promptly and reliably. On a socket that
+# is already open it volunteers stsR only sporadically, and that gap is not
+# academic: on 6 September 2026 the WF-100 was reset and came back within
+# moments, and the relay did not say so on our open socket for another two hours
+# and seven minutes. Home Assistant reported a healthy spa as offline that whole
+# time, and would have gone on doing it.
+#
+# So while nothing is reporting, hang up and dial again on this interval. A
+# reconnect is the one thing that forces a current answer out of the relay, it
+# costs a single handshake, and it only happens when something is already wrong.
+RELINK_PROBE_SECONDS = 300
+
 # The session cookie the app page issues lasts about an hour. Fetching that page
 # before every single write minted a brand new session roughly twenty-four times
 # a day -- a lot of sessions to put through a small third-party relay to
