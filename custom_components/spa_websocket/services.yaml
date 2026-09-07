@@ -33,3 +33,29 @@ set_time:
       example: America/Los_Angeles
       selector:
         text:
+
+take_reading:
+  name: Take a reading
+  description: >-
+    Connect to the spa, wait for the panel to report, and hang up. This is what
+    answers the question a confirmed setpoint cannot: the spa accepting 103F
+    says nothing about whether the water actually moved, and only a reading
+    taken at the checkpoint does. Records a failed "reading" job -- visible on
+    the Action failed sensor -- if the panel says nothing in the window, because
+    "I could not look" has to be distinguishable from "I looked and it was fine".
+  fields:
+    seconds:
+      name: Listening window
+      description: >-
+        How long to wait for the panel to speak, in seconds. Returns as soon as
+        a frame arrives, so only silence costs the full window. Display frames
+        are bursty -- gaps of ten to thirty minutes are normal on a healthy spa
+        -- so a scheduled check should allow minutes, not seconds. Defaults to
+        the same short window the Refresh button uses.
+      required: false
+      example: 300
+      selector:
+        number:
+          min: 1
+          max: 600
+          unit_of_measurement: seconds

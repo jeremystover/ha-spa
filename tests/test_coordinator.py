@@ -48,7 +48,11 @@ sys.modules["spa_websocket"] = _pkg
 
 import spa_websocket.coordinator as coord  # noqa: E402
 from spa_websocket.coordinator import SpaConnection, parse_setpoint  # noqa: E402
-from spa_websocket.const import JOB_CLOCK, JOB_SETPOINT  # noqa: E402
+from spa_websocket.const import (  # noqa: E402
+    JOB_CLOCK,
+    JOB_READING,
+    JOB_SETPOINT,
+)
 from spa_websocket.decode import decode_temperature, plausible  # noqa: E402
 
 HomeAssistantError = sys.modules["homeassistant.exceptions"].HomeAssistantError
@@ -275,6 +279,36 @@ c.temperature, c.measured_at = 91, NOW[0]
 run(c.async_refresh())          # must not raise
 check("keeps the old reading", c.temperature, 91)
 check("keeps the old timestamp", c.measured_at, NOW[0])
+
+print("\na scheduled reading is how we check the water actually moved:")
+c = new_conn(frames=[FRAME])
+run(c.async_take_reading(0.01))
+check("reading job ok", c.jobs[JOB_READING].ok, True)
+check("nothing failing", c.failing, [])
+check("detail carries the number", c.jobs[JOB_READING].detail, "91°F")
+
+print("\na frame that lands while we are waiting on the relay still counts:")
+print("  (it arrives in the opening listen; counting only the trailing one")
+print("   would file a failed reading with a fresh number in hand)")
+c = new_conn(frames=['{"stsR":1}', FRAME])
+run(c.async_take_reading(0.01))
+check("reading job ok", c.jobs[JOB_READING].ok, True)
+check("temperature captured", c.temperature, 91)
+
+print("\nno frame in the window is a FAILED reading, not a silent pass:")
+print("  (comparing the water against a stale number is how you miss a cold tub)")
+c = new_conn(frames=[])
+c.temperature, c.measured_at = 91, NOW[0]
+run(c.async_take_reading(0.01))
+check("reading job failed", c.jobs[JOB_READING].ok, False)
+check("failing names it", c.failing, [JOB_READING])
+check("says it could not look", "no reading" in c.jobs[JOB_READING].detail, True)
+
+print("\nbut the Refresh button a human pressed never sets the alarm:")
+c = new_conn(frames=[])
+run(c.async_refresh())
+check("no job recorded", JOB_READING in c.jobs, False)
+check("nothing failing", c.failing, [])
 
 print("\nthe filtering bit, for verifying the clock later:")
 c = new_conn(frames=[FILTER_FRAME])
