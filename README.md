@@ -162,16 +162,23 @@ believing a stale answer — on 6 September 2026, for 2h07m after the spa had
 already come back. Three deliberate visits beat a standing connection that
 nobody is updating.
 
-**Six HTTP requests a day, and three short visits.** Down from 48 requests and a
-socket held open around the clock with a ping every twenty seconds. The relay is
-a small third-party service built for a browser tab.
+**Six HTTP requests a day, and three short visits.** One socket visit per job:
+two link checks and the clock. Down from 48 requests and a socket held open
+around the clock with a ping every twenty seconds. The relay is a small
+third-party service built for a browser tab.
 
-**Confirmation is a fresh page load, not the POST's echo.** Whether the echo
-carries the new value or the pre-write one was never established against the
-hardware, so trusting it would be guessing. A page fetched a few seconds later
-is the spa's settled answer. A page that comes back with *no* setpoint at all is
-the WF-100 signature — 200 OK, a rendered page, nothing behind it — and is
-reported as exactly that.
+**Confirmation asks the relay before it believes the page.** The readback alone
+is a mirror, not a confirmation: on 8 September 2026 the WF-100 went off the
+cloud and the setpoint job reported "spa confirms 85F" every hour for a day,
+while the clock job said the relay had no link and not one display frame
+arrived. The page was echoing our own POST back at us.
+
+So every setpoint job opens the socket first and asks whether the relay still
+has the spa. Only an explicit denial fails it — the relay does not always
+volunteer `stsR`, and treating silence as failure would swap a false green for a
+false alarm. After that the value is read back from a *fresh* page load rather
+than the POST's echo, and a page with **no setpoint at all** is reported as what
+it is: the WF-100 signature, 200 OK with nothing behind it.
 
 **The clock is written, never confirmed, and says so.** It cannot be read back:
 the display multiplexes between water temperature and setpoint, never the time.
