@@ -194,6 +194,24 @@ check("spa's value reported back", c.reported_setpoint, 103)
 check("nothing is failing", c.failing, [])
 check("confirmed_at stamped", c.setpoint_confirmed_at is not None, True)
 
+print("\nthe relay has lost the spa — its echo is not a confirmation:")
+print("  (on 8 Sep this job reported 'spa confirms 85F' hourly for a day while")
+print("   the clock job said no link and not one frame arrived)")
+c = new_conn(FakeHTTP(), frames=['{"stsR":0}'])
+try:
+    run(c.async_apply_setpoint(103))
+    check("raised", False, True)
+except HomeAssistantError as err:
+    check("raised", True, True)
+    check("names the echo", "echoed the value back" in str(err), True)
+check("job recorded failed", c.jobs[JOB_SETPOINT].ok, False)
+check("no POST was even sent", c._http.posts, 0)
+
+print("\nsilence from the relay is NOT a denial — do not invent a failure:")
+c = new_conn(FakeHTTP(), frames=[])
+run(c.async_apply_setpoint(103))
+check("job ok", c.jobs[JOB_SETPOINT].ok, True)
+
 print("\nthe spa keeps a different value — the write did not land:")
 c = new_conn(FakeHTTP(reports=85))
 try:
@@ -334,11 +352,11 @@ _, session = with_socket([])
 coord.async_get_clientsession = lambda hass: session
 run(c.async_apply_setpoint(103))    # 15:00 here / noon spa-local
 run(c.async_apply_setpoint(85))     # 18:00 here / 3pm spa-local
-check("setpoint jobs are HTTP only", session.connects, 0)
+check("each setpoint job checks the link first", session.connects, 2)
 run(c.async_sync_clock(datetime(2026, 9, 8, 4, 0)))
-check("the clock job is the day's one visit", session.connects, 1)
+check("three short visits in the day", session.connects, 3)
 print(f"  HTTP requests: {http.gets + http.posts}   (was 48 hourly, then 10)")
-print("  socket:        1 short visit    (was open 24h with a 20s heartbeat)")
+print("  socket:        3 short visits   (was open 24h with a 20s heartbeat)")
 check("two setpoint writes", http.posts, 2)
 check("both confirmed", [j.ok for j in c.jobs.values()], [True, True])
 

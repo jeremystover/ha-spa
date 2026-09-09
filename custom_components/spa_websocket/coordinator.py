@@ -241,8 +241,21 @@ class SpaConnection:
         established against the hardware, so trusting it would be guessing; a
         page fetched a few seconds later is the spa's settled answer.
 
+        A fresh page load is still not enough on its own, and this was learned
+        the hard way. On 8 September 2026 the WF-100 went off the cloud and this
+        job reported "spa confirms 85F" every hour for a day, while the clock job
+        said the relay had no link and not one display frame arrived. The page
+        was echoing our own POST back at us. A readback that repeats what you
+        just wrote confirms nothing.
+
+        So ask the relay first, over the socket, whether it still has the spa.
+        One handshake, about ten seconds, and it is the whole difference between
+        a confirmation and a mirror.
+
         Raises when it cannot be confirmed, which is the point of the exercise.
         """
+        await self._require_link(temperature)
+
         base = self._base_url
         payload = {
             "flip-scale": "0",
@@ -285,6 +298,29 @@ class SpaConnection:
             raise HomeAssistantError(detail)
 
         self._record(JOB_SETPOINT, True, f"spa confirms {reported}F")
+
+    async def _require_link(self, temperature: int) -> None:
+        """Fail the setpoint job unless the relay still has a live link.
+
+        Only an explicit denial counts. The relay does not always volunteer
+        stsR, and "has not said" is not "said no" -- treating silence as failure
+        would trade a false green for a false alarm.
+        """
+        try:
+            await self._visit(listen=0)
+        except (aiohttp.ClientError, OSError, TimeoutError) as err:
+            detail = f"could not reach the spa to set {temperature}F: {err}"
+            self._record(JOB_SETPOINT, False, detail)
+            raise HomeAssistantError(detail) from err
+
+        if self.relay_linked is False:
+            detail = (
+                f"did not send {temperature}F: the relay reports no link to the "
+                "spa. Its page would still have echoed the value back as if the "
+                "write had landed"
+            )
+            self._record(JOB_SETPOINT, False, detail)
+            raise HomeAssistantError(detail)
 
     async def _read_back(self, expected: int) -> int | None:
         """Return the spa's own setpoint, retrying while it settles."""
