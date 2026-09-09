@@ -173,12 +173,21 @@ cloud and the setpoint job reported "spa confirms 85F" every hour for a day,
 while the clock job said the relay had no link and not one display frame
 arrived. The page was echoing our own POST back at us.
 
-So every setpoint job opens the socket first and asks whether the relay still
-has the spa. Only an explicit denial fails it — the relay does not always
-volunteer `stsR`, and treating silence as failure would swap a false green for a
-false alarm. After that the value is read back from a *fresh* page load rather
-than the POST's echo, and a page with **no setpoint at all** is reported as what
-it is: the WF-100 signature, 200 OK with nothing behind it.
+So every setpoint job asks the relay whether it still has the spa, and refuses
+to call the echo a confirmation when it says no. Only an explicit denial counts:
+the relay does not always volunteer `stsR`, and treating silence as failure
+would swap a false green for a false alarm.
+
+**It asks after writing, never before, and the answer never withholds the
+write.** On 9 September the relay reported no link at 07:00 and the spa heated
+perfectly that afternoon — the signal was simply wrong. Gating the write behind
+it would have turned a working day into a cold one. Sending into a dead relay
+costs nothing; not sending into a live one costs the whole day. The check earns
+its place by downgrading a confirmation to a doubt, not by refusing to act.
+
+The value is then read back from a *fresh* page load rather than the POST's
+echo, and a page with **no setpoint at all** is reported as what it is: the
+WF-100 signature, 200 OK with nothing behind it.
 
 **The clock is written, never confirmed, and says so.** It cannot be read back:
 the display multiplexes between water temperature and setpoint, never the time.

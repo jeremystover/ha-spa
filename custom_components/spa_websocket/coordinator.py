@@ -248,14 +248,18 @@ class SpaConnection:
         was echoing our own POST back at us. A readback that repeats what you
         just wrote confirms nothing.
 
-        So ask the relay first, over the socket, whether it still has the spa.
-        One handshake, about ten seconds, and it is the whole difference between
-        a confirmation and a mirror.
+        So ask the relay whether it still has the spa, and refuse to call the
+        echo a confirmation when it says no.
+
+        But ask AFTER writing, never before, and never let the answer withhold
+        the write. On 8 September the relay reported no link at 07:00 and the
+        spa heated perfectly that afternoon regardless -- so that signal is not
+        reliable enough to act on, only to doubt on. Gating the write behind it
+        would have turned a working day into a cold one. Sending into a dead
+        relay costs nothing; not sending into a live one costs the whole day.
 
         Raises when it cannot be confirmed, which is the point of the exercise.
         """
-        await self._require_link(temperature)
-
         base = self._base_url
         payload = {
             "flip-scale": "0",
@@ -297,30 +301,31 @@ class SpaConnection:
             self._record(JOB_SETPOINT, False, detail)
             raise HomeAssistantError(detail)
 
+        if not await self._link_still_good():
+            detail = (
+                f"the page echoed {reported}F back, but the relay says it has no "
+                "link to the spa — it would echo either way, so this is not a "
+                "confirmation. The write was sent regardless"
+            )
+            self._record(JOB_SETPOINT, False, detail)
+            raise HomeAssistantError(detail)
+
         self._record(JOB_SETPOINT, True, f"spa confirms {reported}F")
 
-    async def _require_link(self, temperature: int) -> None:
-        """Fail the setpoint job unless the relay still has a live link.
+    async def _link_still_good(self) -> bool:
+        """Whether the relay will vouch for its link to the spa.
 
-        Only an explicit denial counts. The relay does not always volunteer
-        stsR, and "has not said" is not "said no" -- treating silence as failure
-        would trade a false green for a false alarm.
+        Only an explicit denial counts against it. The relay does not always
+        volunteer stsR, and "has not said" is not "said no" -- and a socket that
+        will not open is not evidence about the spa either, since the write it
+        is being asked about went over HTTP and may well have landed.
         """
         try:
             await self._visit(listen=0)
         except (aiohttp.ClientError, OSError, TimeoutError) as err:
-            detail = f"could not reach the spa to set {temperature}F: {err}"
-            self._record(JOB_SETPOINT, False, detail)
-            raise HomeAssistantError(detail) from err
-
-        if self.relay_linked is False:
-            detail = (
-                f"did not send {temperature}F: the relay reports no link to the "
-                "spa. Its page would still have echoed the value back as if the "
-                "write had landed"
-            )
-            self._record(JOB_SETPOINT, False, detail)
-            raise HomeAssistantError(detail)
+            _LOGGER.debug("Could not ask the relay about its link: %s", err)
+            return True
+        return self.relay_linked is not False
 
     async def _read_back(self, expected: int) -> int | None:
         """Return the spa's own setpoint, retrying while it settles."""
