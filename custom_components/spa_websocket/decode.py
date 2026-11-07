@@ -27,11 +27,11 @@ A reading needs both a ones and a tens digit. The Fahrenheit range starts at 45
 so that is never a limit there; in Celsius it means single-digit readings below
 10 are not decoded, which is under the spa's own 7.6 floor anyway.
 
-CAVEAT: this reads the display, and the display is multiplexed. At idle it shows
-the current water temperature, but while the set temperature is being adjusted
-it shows that instead. Callers should check the edit LED (``FLAG_EDIT`` in byte
-4) to tell the two apart rather than trusting every reading as water
-temperature.
+CAVEAT: this reads the display, and the display is multiplexed THREE ways. At
+idle it shows the current water temperature; while the set temperature is being
+adjusted it shows that instead (``FLAG_EDIT`` in byte 4 says which); and it also
+cycles to the time of day. ``decode_temperature`` returns None for a clock frame
+because there is no scale marker on it, and ``decode_clock`` reads those.
 """
 
 from __future__ import annotations
@@ -144,3 +144,91 @@ def decode_temperature(dsp: str) -> tuple[int, str] | None:
     if not plausible(temperature, unit):
         return None
     return temperature, unit
+
+
+def panel_flipped(dsp: str) -> bool | None:
+    """Return True if the panel reads upside down, False if upright, else None.
+
+    Determined from the scale marker, so only a temperature frame answers it.
+    A clock frame carries no marker and returns None -- which is exactly why
+    ``decode_clock`` has to be told the orientation rather than work it out.
+    """
+    if len(dsp) < 8:
+        return None
+    try:
+        raw = bytes.fromhex(dsp[:8])
+    except ValueError:
+        return None
+    chars = [b & SEGMENT_MASK for b in raw]
+    if chars[0] in SEGMENTS_TO_UNIT:
+        return False
+    if rotate(chars[3]) in SEGMENTS_TO_UNIT:
+        return True
+    return None
+
+
+def decode_clock(dsp: str, flipped: bool = False) -> tuple[int, int] | None:
+    """Return ``(hour, minute)`` from a clock frame, or None.
+
+    The panel cycles the time of day through the same four characters it uses
+    for temperature, using the decimal points between the middle two digits as
+    a colon -- which blinks, so half the frames have it dark and it cannot be
+    required as a signature. What marks a clock frame instead is the *absence*
+    of a scale marker: every temperature frame carries an F or a C.
+
+    Captured from a BT-200 at 10:11 and 10:12 spa-local:
+
+        0686bf06  ->  1 0. 1. 1  = 10:11   (colon lit)
+        06063f06  ->  1 0  1  1  = 10:11   (colon dark)
+        5b86bf06  ->  1 0. 1. 2  = 10:12
+
+    This is what makes the clock verifiable. Until it was decoded, setting the
+    spa's clock was write-only: the integration could record that a frame had
+    been delivered but never that the panel agreed, and a drifting clock moves
+    the filter cycles out from under the schedule.
+
+    **The display carries no AM/PM indicator**, so this returns a 12-hour time.
+    Comparing it against the expected spa-local time modulo twelve hours is
+    enough to catch drift, which is the thing worth catching.
+
+    ``flipped`` must come from a temperature frame via ``panel_flipped``; there
+    is nothing in a clock frame to derive it from, and guessing would turn a
+    correct clock into a false alarm.
+    """
+    if len(dsp) < 8:
+        return None
+    try:
+        raw = bytes.fromhex(dsp[:8])
+    except ValueError:
+        return None
+
+    chars = [b & SEGMENT_MASK for b in raw]
+
+    # A scale marker means this is a temperature, not a clock.
+    if chars[0] in SEGMENTS_TO_UNIT or rotate(chars[3]) in SEGMENTS_TO_UNIT:
+        return None
+
+    # Left to right across the panel. Upright, byte 0 is the rightmost
+    # character; flipped, the order reverses and every glyph rotates.
+    if flipped:
+        shown = [rotate(chars[0]), rotate(chars[1]), rotate(chars[2]), rotate(chars[3])]
+    else:
+        shown = [chars[3], chars[2], chars[1], chars[0]]
+
+    tens_hour, ones_hour, tens_min, ones_min = shown
+
+    # A single-digit hour blanks the leading character rather than padding it.
+    hour = 0 if tens_hour == BLANK else SEGMENTS_TO_DIGIT.get(tens_hour, -1) * 10
+    if hour < 0:
+        return None
+    for glyph in (ones_hour, tens_min, ones_min):
+        if glyph not in SEGMENTS_TO_DIGIT:
+            return None
+    hour += SEGMENTS_TO_DIGIT[ones_hour]
+    minute = SEGMENTS_TO_DIGIT[tens_min] * 10 + SEGMENTS_TO_DIGIT[ones_min]
+
+    # The panel runs a 12-hour clock, which rejects most non-clock frames that
+    # happen to hold four readable digits.
+    if not 1 <= hour <= 12 or minute > 59:
+        return None
+    return hour, minute

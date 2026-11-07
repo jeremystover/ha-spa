@@ -160,6 +160,48 @@ briefly, not to hold overnight through a freezing winter.
 `GET /app` also exposes the current setpoint as the form's `value` attribute,
 which is a cleaner readback than the multiplexed display. Not yet wired up.
 
+## The BT-200 speaks the same protocol, better
+
+The spa carries two modules on the panel bus: the **WF-100** (WiFi only, the
+original) and the **BT-200** (Bluetooth *and* WiFi). The iOS app talks only to
+the BT-200. Both reach the same relay, so this is not path redundancy — but the
+BT-200's endpoint is markedly better behaved, and it is the module that stays
+connected.
+
+| | |
+| --- | --- |
+| `wss://accsmartlink.com/wsa/<mac>/M/<id>/<token>` | master |
+| `wss://accsmartlink.com/wsa/<mac>/N/<id>/<token>` | guest, separate token |
+| `https://accsmartlink.com/share/<mac>/N/<id>/<token>?n=<hex name>` | the app's Share link |
+
+`M` is master, `N` is a guest with its own token — so an integration can run on
+a revocable credential instead of the master one. `?n=` is the spa's name as hex
+ASCII (`45646e61547562` = `EdnaTub`). The app also registers an `accsmart://`
+scheme for the same path.
+
+Captured from the app on 7 November 2026, the complete command set:
+
+```json
+{"temp":"101F"}      // absolute setpoint, three digits zero-padded + unit
+{"keysec":"l0"}      // light          (toggle)
+{"keysec":"j0"}      // jets           (toggle)
+{"keysec":"s0"}      // system/filter  (toggle)
+{"time":"1012A"}     // clock, same HHMM+A/P as /wsb
+```
+
+Inbound is `{"dsp":"<12 hex>"}`, byte-for-byte the same display protocol — the
+existing decoder reads it unchanged.
+
+**The setpoint is a socket frame.** That is the whole reason to move: on the
+WF-100 path, setting a temperature meant `GET /app` for a session cookie and
+then a form POST to `/settemp`, whose readback turned out to echo the value just
+written rather than report the spa's. Here there is no HTTP layer left to lie.
+Confirmation comes from the panel's own display instead — send `{"temp":"101F"}`
+and the setpoint appears in a `dsp` frame with the edit bit lit.
+
+`keysec` codes are still toggles, so a pump cannot be set to a speed, only
+cycled. Confirmed rather than assumed this time.
+
 ## Setting the clock
 
 A JSON frame on the WebSocket:
@@ -178,9 +220,29 @@ is no separate native API, just the same web UI in a wrapper.
 There is **no set-time HTTP endpoint** — the web app has only `settemp` and
 `settz` — which is why this took a proxy capture to find.
 
-The clock **cannot be read back**, so it is re-asserted on a schedule rather
-than checked and corrected. Writing the correct time to an already-correct
-clock changes nothing.
+The clock **can** be read back, which was not known until November 2026: the
+panel cycles the time of day through the same four characters as the
+temperature, using the decimal points between the middle digits as a colon.
+
+```
+0686bf06  ->  1 0. 1. 1  = 10:11   (colon lit)
+06063f06  ->  1 0  1  1  = 10:11   (colon dark)
+5b86bf06  ->  1 0. 1. 2  = 10:12
+```
+
+The colon blinks at 1 Hz, so it cannot be used as the signature of a clock
+frame. What identifies one is the **absence of a scale marker** — every
+temperature frame carries an F or a C, and a clock frame carries neither. Which
+also means a clock frame cannot tell you the panel's orientation; take that from
+a temperature frame.
+
+There is no AM/PM indicator on the display, so a reading is 12-hour. Comparing
+it against expected spa-local time modulo twelve hours is enough to catch drift,
+which is what matters: the filter cycles are programmed against this clock, and
+a drifting clock moves them out from under the schedule.
+
+Before this was decoded, the clock was write-only — the integration could record
+that a frame had been delivered but never that the panel agreed.
 
 ## Setting the timezone
 
