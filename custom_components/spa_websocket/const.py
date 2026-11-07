@@ -4,9 +4,31 @@ DOMAIN = "spa_websocket"
 
 CONF_URL = "url"
 
-# Command codes sent to the spa over the WebSocket.
-CMD_JETS = "3"
-CMD_FILTER = "4"
+# A second module's URL, tried only when a write against the first one fails.
+#
+# This is NOT path redundancy and must not be sold as such: both modules reach
+# the spa through the same relay at accsmartlink.com, so a relay outage takes
+# both down together. What it covers is one module dropping off the cloud while
+# the other stays up -- which is exactly what the WF-100 did in September 2026,
+# and the only reason there is a second URL worth keeping.
+CONF_FALLBACK_URL = "fallback_url"
+
+# Which module an endpoint belongs to. See transport.py.
+PANEL = "panel"  # BT-200: Bluetooth and WiFi, what the iOS app talks to
+RELAY = "relay"  # WF-100: WiFi only, what the legacy web app talks to
+
+# Logical panel keys. The two modules share no command codes, so a button says
+# what it means and the transport decides how to say it on the wire.
+KEY_JETS = "jets"
+KEY_FILTER = "filter"
+
+# WF-100 web-relay codes, taken from the app page's own button handlers.
+RELAY_KEY_CODES = {KEY_JETS: "3", KEY_FILTER: "4"}
+
+# BT-200 keysec codes, captured from the iOS app on 7 November 2026. There is
+# also a light key, "l0", that nothing here presses. All three are toggles --
+# confirmed by pressing each twice and watching the LED bits, not assumed.
+PANEL_KEY_CODES = {KEY_JETS: "j0", KEY_FILTER: "s0"}
 
 # Jets state numeric codes -> human-readable names.
 STATE_OFF = 0
@@ -75,6 +97,20 @@ RELAY_ANSWER_SECONDS = 10
 # established against the hardware.
 CONFIRM_ATTEMPTS = 3
 CONFIRM_DELAY_SECONDS = 5
+
+# Confirming a setpoint on the BT-200: how long to listen for the panel to show
+# the number back. Nothing like the HTTP readback -- this is the panel's own
+# display, with the edit LED lit, and it cannot echo a value the panel does not
+# hold.
+#
+# While the panel is in edit mode it repeats that frame steadily: the capture
+# shows the three setpoints pressed appearing 32, 32 and 16 times. So this
+# window is not a coin toss the way a water-temperature reading is. What is not
+# known is how long edit mode lasts after the last press, which is why this is
+# generous rather than tight -- but still short enough that a setpoint that
+# cannot be confirmed fails inside a minute instead of stalling the automation
+# that asked for it.
+SETPOINT_ECHO_SECONDS = 45
 
 # The scheduled jobs, named so a failure can say which one.
 JOB_SETPOINT = "setpoint"

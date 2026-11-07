@@ -3,15 +3,31 @@
     "step": {
       "user": {
         "title": "Spa WebSocket",
-        "description": "Connect to your spa's WebSocket endpoint.",
+        "description": "Connect to your spa's WebSocket endpoint. The BT-200 (a /wsa/ URL) is the better one to drive: it takes the setpoint on the socket and shows it back on the panel's own display.",
         "data": {
           "name": "Name",
-          "url": "WebSocket URL (wss://...)"
+          "url": "WebSocket URL (wss://...)",
+          "fallback_url": "Second module's URL (optional)"
+        },
+        "data_description": {
+          "fallback_url": "The spa's other module, tried only when a write fails on the first. Both reach the spa through the same relay, so this is not a second path to it -- it covers one module dropping off the cloud while the other stays up."
+        }
+      },
+      "reconfigure": {
+        "title": "Spa WebSocket",
+        "description": "Point this spa at a different URL. Use this when the token changes, or to switch which module the integration drives.",
+        "data": {
+          "url": "WebSocket URL (wss://...)",
+          "fallback_url": "Second module's URL (optional)"
+        },
+        "data_description": {
+          "fallback_url": "The spa's other module, tried only when a write fails on the first. Both reach the spa through the same relay, so this is not a second path to it -- it covers one module dropping off the cloud while the other stays up."
         }
       }
     },
     "error": {
-      "invalid_url": "The URL must start with ws:// or wss://."
+      "invalid_url": "The URL must start with ws:// or wss://.",
+      "same_url": "The second URL has to be a different module, not the same one again."
     },
     "abort": {
       "already_configured": "This spa URL is already configured."

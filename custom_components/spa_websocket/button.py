@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CMD_FILTER, CMD_JETS, DOMAIN
+from .const import DOMAIN, KEY_FILTER, KEY_JETS
 from .coordinator import SpaConnection
 
 
@@ -22,10 +22,10 @@ async def async_setup_entry(
     async_add_entities(
         [
             SpaCommandButton(
-                connection, entry, "Jets", "jets", CMD_JETS, "mdi:hot-tub"
+                connection, entry, "Jets", KEY_JETS, "mdi:hot-tub"
             ),
             SpaCommandButton(
-                connection, entry, "Filter", "filter", CMD_FILTER, "mdi:air-filter"
+                connection, entry, "Filter", KEY_FILTER, "mdi:air-filter"
             ),
             SpaRefreshButton(connection, entry),
         ]
@@ -48,7 +48,13 @@ class SpaButtonBase(ButtonEntity):
 
 
 class SpaCommandButton(SpaButtonBase):
-    """A momentary button that sends a single command code to the spa."""
+    """A momentary button that presses one key on the spa's panel.
+
+    Carries the key it means -- ``jets``, ``filter`` -- rather than a wire code,
+    because the WF-100 and the BT-200 share neither. The ``unique_id`` is
+    derived from the same string, which is also what it always was, so the
+    entity_ids and the automations built on them are unaffected.
+    """
 
     def __init__(
         self,
@@ -56,18 +62,17 @@ class SpaCommandButton(SpaButtonBase):
         entry: ConfigEntry,
         name: str,
         key: str,
-        code: str,
         icon: str,
     ) -> None:
         """Initialize the button."""
         super().__init__(connection, entry, key)
-        self._code = code
+        self._key = key
         self._attr_name = name
         self._attr_icon = icon
 
     async def async_press(self) -> None:
-        """Open a socket, send the command code, and hang up."""
-        await self._connection.async_press(self._code)
+        """Open a socket, press the key, and hang up."""
+        await self._connection.async_press(self._key)
 
 
 class SpaRefreshButton(SpaButtonBase):

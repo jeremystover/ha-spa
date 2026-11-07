@@ -52,7 +52,12 @@ from spa_websocket.const import (  # noqa: E402
     JOB_CLOCK,
     JOB_READING,
     JOB_SETPOINT,
+    KEY_FILTER,
+    KEY_JETS,
+    PANEL,
+    RELAY,
 )
+from spa_websocket.transport import transport_for  # noqa: E402
 from spa_websocket.decode import (  # noqa: E402
     decode_clock,
     decode_temperature,
@@ -67,9 +72,28 @@ coord.CONFIRM_DELAY_SECONDS = 0
 coord.RELAY_ANSWER_SECONDS = 0.01
 coord.VISIT_SECONDS = 0.01
 coord.REFRESH_SECONDS = 0.01
+coord.SETPOINT_ECHO_SECONDS = 0.05
 
 FRAME = '{"dsp":"007d30ce0500"}'          # 91F, heating + low jets
 FILTER_FRAME = '{"dsp":"007d30ce1000"}'   # filtering bit set
+
+# The BT-200's URL *shape*, from the 7 November 2026 capture. The MAC, the
+# account id and the token are all made up: the token is the credential -- it is
+# the only thing guarding the spa -- and the other two identify the hardware, so
+# none of the three belongs in a repository.
+PANEL_URL = "wss://accsmartlink.com/wsa/0123456789ab/M/5000000000/" + "0" * 64
+RELAY_URL = "wss://h/spa/TOKEN/wsb"
+
+# Setpoint frames as the panel itself sent them, edit LED lit.
+SETPOINT_FRAMES = {
+    99: '{"dsp":"f16f6f002000"}',
+    100: '{"dsp":"f13f3f062000"}',
+    101: '{"dsp":"f1063f062000"}',
+}
+# A clock frame that ALSO carries the edit bit. Captured, not invented: the edit
+# bit on its own cannot mean "this is a setpoint".
+CLOCK_EDIT_FRAME = '{"dsp":"5b86bf06a000"}'
+
 fails = []
 
 
@@ -182,11 +206,16 @@ def with_socket(frames):
     return ws, session
 
 
-def new_conn(http=None, frames=()):
-    conn = SpaConnection(object(), "wss://h/spa/TOKEN/wsb")
+def new_conn(http=None, frames=(), url=RELAY_URL, fallback=None):
+    conn = SpaConnection(object(), url, fallback)
     conn._http = http if http is not None else FakeHTTP()
     with_socket(frames)
     return conn
+
+
+def new_panel(frames=(), fallback=None):
+    """A connection driving the BT-200, with the socket faked."""
+    return new_conn(frames=frames, url=PANEL_URL, fallback=fallback)
 
 
 # =============================================================================
@@ -260,6 +289,161 @@ check("failing after a good run", c.failing, [])
 
 
 # =============================================================================
+print("\n=== the transport is read off the URL, not configured ===")
+check("a /wsa/ URL is the BT-200", transport_for(PANEL_URL).kind, PANEL)
+check("a /wsb URL is the WF-100", transport_for(RELAY_URL).kind, RELAY)
+check("guest tokens too", transport_for(PANEL_URL.replace("/M/", "/N/")).kind, PANEL)
+check("case does not matter",
+      transport_for(PANEL_URL.replace("89ab", "89AB")).kind, PANEL)
+print("  (a keysec frame means nothing to the web relay and a bare \"3\" means")
+print("   nothing to the BT-200, so the two must never be able to disagree)")
+
+t_panel, t_relay = transport_for(PANEL_URL), transport_for(RELAY_URL)
+print("\nthe frames, byte for byte as the iOS app was captured sending them:")
+check("setpoint", t_panel.setpoint_frame(101), '{"temp":"101F"}')
+check("zero padded -- the app sent 099F, not 99F",
+      t_panel.setpoint_frame(99), '{"temp":"099F"}')
+check("the relay has no socket setpoint", t_relay.setpoint_frame(101), None)
+check("panel jets", t_panel.key_frame(KEY_JETS), '{"keysec":"j0"}')
+check("panel filter is the system key", t_panel.key_frame(KEY_FILTER),
+      '{"keysec":"s0"}')
+check("relay jets stays a bare code", t_relay.key_frame(KEY_JETS), "3")
+check("relay filter", t_relay.key_frame(KEY_FILTER), "4")
+check("the clock frame is shared", t_panel.clock_frame(datetime(2026, 11, 7, 10, 12)),
+      '{"time":"1012A"}')
+
+
+# =============================================================================
+print("\n=== the BT-200 setpoint: confirmed by the panel's own display ===")
+print("  (the first real confirmation this integration has had -- the WF-100's")
+print("   page spent a week rendering a setpoint the spa never accepted)")
+c = new_panel(frames=[SETPOINT_FRAMES[101]])
+run(c.async_apply_setpoint(101))
+check("job recorded ok", c.jobs[JOB_SETPOINT].ok, True)
+check("detail names the module", c.jobs[JOB_SETPOINT].detail, "BT-200 confirms 101F")
+check("setpoint read off the panel", c.reported_setpoint, 101)
+check("confirmed_at stamped", c.setpoint_confirmed_at, NOW[0])
+check("nothing over HTTP at all", (c._http.gets, c._http.posts), (0, 0))
+
+ws, _ = with_socket([SETPOINT_FRAMES[99]])
+c = new_panel()
+coord.async_get_clientsession = lambda hass, _ws=ws: FakeSession(_ws)
+run(c.async_apply_setpoint(99))
+check("sent the frame the app sends", ws.sent, ['{"temp":"099F"}'])
+
+print("\nthe panel shows a different number -- the write did not land:")
+c = new_panel(frames=[SETPOINT_FRAMES[100]])
+try:
+    run(c.async_apply_setpoint(101))
+    check("raised", False, True)
+except HomeAssistantError as err:
+    check("raised", True, True)
+    check("says both numbers", "101" in str(err) and "100" in str(err), True)
+check("job recorded failed", c.jobs[JOB_SETPOINT].ok, False)
+check("failing names the job", c.failing, [JOB_SETPOINT])
+
+print("\nthe panel never shows a setpoint -- nothing confirms it:")
+c = new_panel(frames=[FRAME])
+try:
+    run(c.async_apply_setpoint(101))
+    check("raised", False, True)
+except HomeAssistantError as err:
+    check("raised", True, True)
+    check("says nothing confirms it", "never showed a setpoint" in str(err), True)
+check("job recorded failed", c.jobs[JOB_SETPOINT].ok, False)
+check("the water reading still landed", c.temperature, 91)
+
+print("\nthe edit bit alone is NOT a setpoint -- a captured CLOCK frame has it:")
+print("  (5b86bf06a000 is 10:12 with the edit LED lit; reading that as a")
+print("   setpoint would confirm any write with whatever the clock said)")
+c = new_panel(frames=[CLOCK_EDIT_FRAME])
+try:
+    run(c.async_apply_setpoint(101))
+    check("raised", False, True)
+except HomeAssistantError as err:
+    check("raised", True, True)
+    check("not mistaken for a setpoint", "never showed a setpoint" in str(err), True)
+check("nothing claimed as the setpoint", c.reported_setpoint, None)
+
+print("\na stale echo from an earlier visit cannot confirm the next write:")
+print("  (believing a number we already had is the September failure exactly)")
+c = new_panel(frames=[SETPOINT_FRAMES[101]])
+run(c.async_apply_setpoint(101))
+check("first write confirmed", c.jobs[JOB_SETPOINT].ok, True)
+with_socket([])                       # the panel says nothing this time
+try:
+    run(c.async_apply_setpoint(85))
+    check("raised", False, True)
+except HomeAssistantError as err:
+    check("raised", True, True)
+    check("did not reuse the 101", "never showed a setpoint" in str(err), True)
+check("job recorded failed", c.jobs[JOB_SETPOINT].ok, False)
+
+print("\nan edit frame caught on any visit updates the reported setpoint:")
+c = new_panel(frames=[SETPOINT_FRAMES[100]])
+run(c.async_refresh())
+check("free truth, taken", c.reported_setpoint, 100)
+check("and not mistaken for the water", c.temperature, None)
+
+
+# =============================================================================
+print("\n=== the fallback: one module dropping, not a second path ===")
+print("  (both modules reach the spa through the same relay, so a relay outage")
+print("   takes both down together -- this covers the September case, where the")
+print("   WF-100 went off the cloud while the panel itself was fine)")
+c = new_panel(frames=[], fallback=RELAY_URL)
+c._http = FakeHTTP()
+run(c.async_apply_setpoint(103))
+check("confirmed on the fallback", c.jobs[JOB_SETPOINT].ok, True)
+check("detail names which module answered",
+      c.jobs[JOB_SETPOINT].detail, "WF-100 confirms 103F")
+check("the fallback's write really went out", c._http.posts, 1)
+
+print("\nthe primary works, so the fallback is never touched:")
+c = new_panel(frames=[SETPOINT_FRAMES[101]], fallback=RELAY_URL)
+c._http = FakeHTTP()
+run(c.async_apply_setpoint(101))
+check("confirmed on the primary", c.jobs[JOB_SETPOINT].detail,
+      "BT-200 confirms 101F")
+check("no HTTP at all", (c._http.gets, c._http.posts), (0, 0))
+
+print("\nboth fail -- the alarm has to name both, not just the last one:")
+c = new_panel(frames=[], fallback=RELAY_URL)
+c._http = FakeHTTP(reports="offline")
+try:
+    run(c.async_apply_setpoint(103))
+    check("raised", False, True)
+except HomeAssistantError as err:
+    check("raised", True, True)
+    check("names the BT-200", "BT-200" in str(err), True)
+    check("names the WF-100", "WF-100" in str(err), True)
+check("job recorded failed", c.jobs[JOB_SETPOINT].ok, False)
+
+print("\nthe clock falls back the same way:")
+ws, _ = with_socket([])
+c = new_panel(fallback=RELAY_URL)
+coord.async_get_clientsession = lambda hass, _ws=ws: FakeSession(_ws)
+run(c.async_sync_clock(datetime(2026, 11, 7, 4, 0)))
+check("delivered", c.jobs[JOB_CLOCK].ok, True)
+print("  (both modules take the same clock frame, so a single socket that")
+print("   opens is enough -- there is nothing here for the fallback to fix)")
+
+print("\nbut a key press never falls back -- a doubled toggle is worse:")
+c = new_panel(fallback=RELAY_URL)
+ws, _ = with_socket([])
+coord.async_get_clientsession = lambda hass, _ws=ws: FakeSession(_ws)
+run(c.async_press(KEY_JETS))
+check("one frame, the panel's", ws.sent, ['{"keysec":"j0"}'])
+
+print("\nand send_raw passes the payload through verbatim, for probing:")
+c = new_panel()
+ws, _ = with_socket([])
+coord.async_get_clientsession = lambda hass, _ws=ws: FakeSession(_ws)
+run(c.async_send_raw('{"keysec":"l0"}'))
+check("untouched", ws.sent, ['{"keysec":"l0"}'])
+
+
+# =============================================================================
 print("\n=== the clock job: delivery, honestly labelled ===")
 c = new_conn(frames=['{"stsR":1}'])
 run(c.async_sync_clock(datetime(2026, 9, 8, 15, 21)))
@@ -268,7 +452,7 @@ ws, _ = with_socket(['{"stsR":1}'])
 c2 = new_conn(frames=[])
 coord.async_get_clientsession = lambda hass: FakeSession(ws)
 run(c2.async_sync_clock(datetime(2026, 9, 8, 15, 21)))
-check("sent the right frame", ws.sent, ['{"time": "0321P"}'])
+check("sent the right frame", ws.sent, ['{"time":"0321P"}'])
 
 print("\nmidnight and noon are the edge cases that break 12-hour clocks:")
 for hour, minute, want in [(0, 0, "1200A"), (12, 0, "1200P"), (13, 5, "0105P")]:
@@ -276,7 +460,7 @@ for hour, minute, want in [(0, 0, "1200A"), (12, 0, "1200P"), (13, 5, "0105P")]:
     c3 = new_conn()
     coord.async_get_clientsession = lambda hass, _ws=ws: FakeSession(_ws)
     run(c3.async_sync_clock(datetime(2026, 9, 8, hour, minute)))
-    check(f"{hour:02d}:{minute:02d}", ws.sent[0], '{"time": "%s"}' % want)
+    check(f"{hour:02d}:{minute:02d}", ws.sent[0], '{"time":"%s"}' % want)
 
 print("\nthe relay says it has lost the spa — do not pretend the clock was set:")
 c = new_conn(frames=['{"stsR":0}'])

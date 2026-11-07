@@ -26,10 +26,14 @@ async def async_setup_entry(
 class SpaTargetTemperature(NumberEntity):
     """The spa's target temperature.
 
-    Shows the spa's own answer, read back off its page after every write, not
-    the value Home Assistant last sent. Setting it raises if the spa does not
-    confirm, so a scheduled change that goes nowhere fails loudly instead of
-    looking like success.
+    Shows the spa's own answer after every write, not the value Home Assistant
+    last sent. On the BT-200 that answer is the panel's display with its edit
+    LED lit, which cannot show a number the panel does not hold; on the WF-100
+    it is the rendered page, which has been caught echoing the write back and is
+    believed only as far as the relay will vouch for its link.
+
+    Setting it raises if the spa does not confirm, so a scheduled change that
+    goes nowhere fails loudly instead of looking like success.
     """
 
     _attr_has_entity_name = True

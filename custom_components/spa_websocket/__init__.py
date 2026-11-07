@@ -15,6 +15,7 @@ from .const import (
     ATTR_CODE,
     ATTR_SECONDS,
     ATTR_TIMEZONE,
+    CONF_FALLBACK_URL,
     CONF_URL,
     DOMAIN,
     MAX_READING_SECONDS,
@@ -44,15 +45,17 @@ TAKE_READING_SCHEMA = vol.Schema(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Spa WebSocket from a config entry."""
-    connection = SpaConnection(hass, entry.data[CONF_URL])
+    connection = SpaConnection(
+        hass, entry.data[CONF_URL], entry.data.get(CONF_FALLBACK_URL)
+    )
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = connection
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     async def handle_send_raw(call: ServiceCall) -> None:
-        """Send one raw command code to every configured spa."""
+        """Send one raw frame to every configured spa, exactly as given."""
         code = call.data[ATTR_CODE]
         for conn in hass.data[DOMAIN].values():
-            await conn.async_press(code)
+            await conn.async_send_raw(code)
 
     async def handle_set_time(call: ServiceCall) -> None:
         """Set every configured spa's clock to the current wall time."""
