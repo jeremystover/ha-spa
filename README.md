@@ -47,11 +47,30 @@ the spa sits in the same zone as the HA host. Pass the zone explicitly if not.
 `https://github.com/jeremystover/ha-spa` as an **Integration** → download →
 restart → Settings → Devices & services → Add integration → Spa WebSocket.
 
-Configuration takes one value: the spa's WebSocket URL, of the form
-`wss://accsmartlink.com/spa/<token>/wsb`.
+Configuration takes the spa's WebSocket URL. The spa has two modules on its
+panel bus and either will do:
 
-> **The token in that URL is a credential.** Anyone holding it can control the
-> spa. Don't paste it into issues, PRs, logs, or screenshots.
+| | |
+| --- | --- |
+| `wss://accsmartlink.com/wsa/<mac>/M/<id>/<token>` | **BT-200** — prefer this |
+| `wss://accsmartlink.com/spa/<token>/wsb` | WF-100, the legacy web relay |
+
+Prefer the BT-200 because the setpoint is a socket frame confirmed against the
+panel's own display. On the WF-100 it is a form POST confirmed against a page
+that has been caught echoing the write back — see
+[docs/PROTOCOL.md](docs/PROTOCOL.md#confirming-a-write). Which module a URL
+belongs to is read off its shape; there is nothing to pick.
+
+A second URL is optional, and is used only to retry a write that failed on the
+first. **It is not a second path to the spa** — both modules go through the same
+relay, so a relay outage takes both down together. What it covers is one module
+dropping off the cloud while the other stays up, which is what the WF-100 did in
+September 2026.
+
+> **The token in either URL is a credential.** Anyone holding it can control the
+> spa. Don't paste it into issues, PRs, logs, or screenshots. The `/wsa/` path
+> also carries the module's MAC and the account id; treat the whole URL as
+> secret.
 
 HACS tracks this repo by commit, not release. If an update doesn't appear,
 use ⋮ → **Update information** on the repository first.

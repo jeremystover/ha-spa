@@ -13,6 +13,12 @@ and a failure to verify is the only thing worth an alarm.
 So this connects when it has something to do, confirms it, and hangs up. Between
 visits the readings keep their last value and say when they were taken, which is
 honest: a reading from this morning is still the truth about this morning.
+
+*Which* endpoint it visits is read off the URL — see ``transport.py``. On the
+BT-200 the setpoint is a socket frame confirmed against the panel's own display,
+which is the whole reason to prefer it; on the WF-100 it is a form POST
+confirmed against a page that has been caught echoing the write back. A second
+URL may be configured, and a write that fails on the first is tried on it.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -51,11 +57,13 @@ from .const import (
     PATH_SETTEMP,
     REFRESH_SECONDS,
     RELAY_ANSWER_SECONDS,
+    SETPOINT_ECHO_SECONDS,
     STATE_NAMES,
     STATE_OFF,
     VISIT_SECONDS,
 )
 from .decode import decode_temperature
+from .transport import Transport, transport_for
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -94,10 +102,14 @@ class JobResult:
 class SpaConnection:
     """Talks to one spa in short visits, and remembers what it was told."""
 
-    def __init__(self, hass: HomeAssistant, url: str) -> None:
+    def __init__(
+        self, hass: HomeAssistant, url: str, fallback_url: str | None = None
+    ) -> None:
         """Initialize the connection."""
         self.hass = hass
         self.url = url
+        self.transport = transport_for(url)
+        self.fallback = transport_for(fallback_url) if fallback_url else None
 
         # Last known readings. None of this expires. An hours-old temperature is
         # not wrong, it is old, and `measured_at` is what says so -- whereas
@@ -118,6 +130,13 @@ class SpaConnection:
         # Whether the relay claimed a live link during the visit in progress.
         # None until it says, because "has not said" is not "said no".
         self.relay_linked: bool | None = None
+
+        # The setpoint the panel showed during the visit in progress, from a
+        # display frame with the edit LED lit. Reset at the start of every
+        # setpoint write and never carried between visits: a number left over
+        # from an earlier visit would confirm a write that never landed, which
+        # is the September failure wearing a different hat.
+        self._edit_reading: int | None = None
 
         # How each scheduled job last went. This is the alarm surface.
         self.jobs: dict[str, JobResult] = {}
@@ -165,27 +184,38 @@ class SpaConnection:
             _LOGGER.error("Spa %s job did NOT confirm: %s", job, detail)
         self._notify_listeners()
 
-    @property
-    def _base_url(self) -> str:
-        """Return the HTTP base for this spa, derived from the socket URL.
+    @staticmethod
+    def _base_url(transport: Transport) -> str:
+        """Return the HTTP base for a web-relay endpoint.
 
         ``wss://host/spa/<token>/wsb`` -> ``https://host/spa/<token>``
+
+        Only meaningful for the WF-100. The BT-200's ``/wsa/`` path has no HTTP
+        sibling at all, which is the point: nothing to fetch, nothing to echo.
         """
-        base = self.url.replace("wss://", "https://").replace("ws://", "http://")
+        base = transport.url.replace("wss://", "https://").replace("ws://", "http://")
         return base.rsplit("/", 1)[0]
 
     # ---- the socket, opened only when there is something to do ---------------
 
     async def _listen(
-        self, ws: aiohttp.ClientWebSocketResponse, seconds: float
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        seconds: float,
+        done: Callable[[], bool] | None = None,
     ) -> bool:
-        """Read frames for up to ``seconds``, returning once the spa speaks.
+        """Read frames for up to ``seconds``, returning once we have an answer.
 
-        Best effort by design. Display frames are bursty -- gaps of ten to
-        thirty minutes are normal on a perfectly healthy spa -- so a visit can
-        easily end without one arriving. That is not a fault and must never be
-        reported as one: the confirmations that matter go over HTTP. A frame
-        caught here is a bonus reading, nothing more.
+        By default the answer is "the panel spoke at all", and that is best
+        effort by design: display frames are bursty -- gaps of ten to thirty
+        minutes are normal on a perfectly healthy spa -- so a visit can easily
+        end without one arriving. That is not a fault and must never be reported
+        as one. A frame caught that way is a bonus reading, nothing more.
+
+        ``done`` is for the one case that is not best effort: a setpoint write,
+        which waits for the specific frame that confirms it rather than for any
+        frame. While the panel is in edit mode it repeats that frame steadily,
+        so there is a real answer to wait for.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + seconds
@@ -195,7 +225,8 @@ class SpaConnection:
             except TimeoutError:
                 return False
             if msg.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
-                if self._handle_message(msg.data):
+                spoke = self._handle_message(msg.data)
+                if done() if done is not None else spoke:
                     return True
             elif msg.type in (
                 aiohttp.WSMsgType.CLOSE,
@@ -206,7 +237,12 @@ class SpaConnection:
                 return False
         return False
 
-    async def _visit(self, send: str | None = None, listen: float | None = None) -> bool:
+    async def _visit(
+        self,
+        transport: Transport,
+        send: str | None = None,
+        listen: float | None = None,
+    ) -> bool:
         """Open the socket, optionally send one frame, listen briefly, hang up.
 
         The relay states its link on connect, promptly and reliably, so opening
@@ -216,7 +252,7 @@ class SpaConnection:
         self.relay_linked = None
         before = self._frames
         session = async_get_clientsession(self.hass)
-        async with session.ws_connect(self.url, heartbeat=HEARTBEAT) as ws:
+        async with session.ws_connect(transport.url, heartbeat=HEARTBEAT) as ws:
             # Give the relay its moment to volunteer stsR before acting on it.
             await self._listen(ws, RELAY_ANSWER_SECONDS)
             if send is not None:
@@ -233,8 +269,128 @@ class SpaConnection:
 
     # ---- the three jobs ------------------------------------------------------
 
+    async def _write(
+        self, attempt: Callable[[Transport], Awaitable[None]]
+    ) -> Transport:
+        """Run a write against the primary module, then the fallback.
+
+        Returns whichever transport got it done. Raises with *both* failures
+        named when neither did, because "the spa did not take it" is a different
+        problem from "the spa took it, on the other module" and the alarm text
+        is the only place that distinction survives.
+
+        Worth being clear about what this does not buy. Both modules reach the
+        spa through the same relay, so a relay outage takes both down together --
+        this is not path redundancy and must never be described as such. What it
+        covers is one module dropping off the cloud while the other stays up,
+        which is precisely what the WF-100 did in September 2026 and the only
+        reason a second URL is worth keeping.
+        """
+        errors = (HomeAssistantError, aiohttp.ClientError, OSError, TimeoutError)
+        try:
+            await attempt(self.transport)
+        except errors as first:
+            if self.fallback is None:
+                raise HomeAssistantError(str(first) or repr(first)) from first
+            # Loudly, even though the fallback may yet succeed: a primary that
+            # has quietly failed every day for a week is the thing that cost
+            # two days of cold water, and a job recorded as confirmed will not
+            # say so.
+            _LOGGER.warning(
+                "Spa write failed on the %s, trying the %s: %s",
+                self.transport.label,
+                self.fallback.label,
+                first,
+            )
+            try:
+                await attempt(self.fallback)
+            except errors as second:
+                raise HomeAssistantError(
+                    f"failed on the {self.transport.label} ({first}) and on the "
+                    f"{self.fallback.label} ({second})"
+                ) from second
+            return self.fallback
+        return self.transport
+
     async def async_apply_setpoint(self, temperature: int) -> None:
         """Set the target temperature and confirm the spa took it.
+
+        How depends on the module. The BT-200 takes it as a socket frame and
+        shows it back on the panel; the WF-100 takes a form POST and renders it
+        on a page. Only the first of those is a confirmation in any strong
+        sense, and the difference is the reason this work was done at all.
+
+        Raises when it cannot be confirmed, which is the point of the exercise.
+        """
+
+        async def attempt(transport: Transport) -> None:
+            if transport.is_panel:
+                await self._setpoint_on_panel(transport, temperature)
+            else:
+                await self._setpoint_on_relay(transport, temperature)
+
+        try:
+            used = await self._write(attempt)
+        except HomeAssistantError as err:
+            detail = f"setting {temperature}F failed: {err}"
+            self._record(JOB_SETPOINT, False, detail)
+            raise HomeAssistantError(detail) from err
+
+        self._record(JOB_SETPOINT, True, f"{used.label} confirms {temperature}F")
+
+    async def _setpoint_on_panel(
+        self, transport: Transport, temperature: int
+    ) -> None:
+        """Set the setpoint on the BT-200 and read it back off the panel.
+
+        One socket frame, then wait for the panel to show the number with its
+        edit LED lit. That is a real confirmation and the first one this
+        integration has ever had: the display is the panel's own output, so it
+        cannot show a value the panel does not hold. Contrast the WF-100's page,
+        which spent a week rendering a setpoint the spa had never accepted.
+
+        Note that the edit bit alone does not make a frame a setpoint -- the
+        capture includes a *clock* frame with it lit. What makes one is the edit
+        bit plus a reading that decodes as a temperature, which is what
+        ``_handle_message`` requires before recording anything here.
+        """
+        frame = transport.setpoint_frame(temperature)
+        if frame is None:  # pragma: no cover - transport.is_panel guards this
+            raise HomeAssistantError(f"the {transport.label} has no setpoint frame")
+
+        self._edit_reading = None
+        session = async_get_clientsession(self.hass)
+        async with session.ws_connect(transport.url, heartbeat=HEARTBEAT) as ws:
+            # Send first and ask questions afterwards. The relay's own link
+            # claim is not reliable enough to withhold a write on: on 8
+            # September it reported no link at 07:00 and the spa heated
+            # perfectly that afternoon. Sending into a dead module costs
+            # nothing; not sending into a live one costs the whole day.
+            await ws.send_str(frame)
+            await self._listen(
+                ws,
+                SETPOINT_ECHO_SECONDS,
+                done=lambda: self._edit_reading == temperature,
+            )
+        shown = self._edit_reading
+        self._notify_listeners()
+
+        if shown is None:
+            raise HomeAssistantError(
+                f"sent {temperature}F, but the panel never showed a setpoint in "
+                f"{SETPOINT_ECHO_SECONDS}s — nothing confirms it landed"
+            )
+        if shown != temperature:
+            raise HomeAssistantError(
+                f"sent {temperature}F, but the panel shows {shown}F"
+            )
+        self.reported_setpoint = shown
+        self.setpoint_confirmed_at = dt_util.utcnow()
+
+    async def _setpoint_on_relay(
+        self, transport: Transport, temperature: int
+    ) -> None:
+        """Set the setpoint on the WF-100, and distrust the readback.
 
         Confirmation is a *fresh* page load, not the POST's own echo. Whether
         that echo carries the new value or the pre-write one was never
@@ -260,59 +416,44 @@ class SpaConnection:
 
         Raises when it cannot be confirmed, which is the point of the exercise.
         """
-        base = self._base_url
+        base = self._base_url(transport)
         payload = {
             "flip-scale": "0",
             "void": str(temperature),
             "temp": str(temperature),
         }
 
-        try:
-            # The app page is what issues the session cookie the POST needs.
-            async with self._http.get(f"{base}/{PATH_APP}") as page:
-                if page.status != 200:
-                    raise HomeAssistantError(f"app page returned {page.status}")
-                await page.text()
-            async with self._http.post(f"{base}/{PATH_SETTEMP}", data=payload) as resp:
-                if resp.status != 200:
-                    raise HomeAssistantError(f"settemp returned {resp.status}")
-                await resp.text()
-            reported = await self._read_back(temperature)
-        except (aiohttp.ClientError, TimeoutError) as err:
-            detail = f"could not reach the spa to set {temperature}F: {err}"
-            self._record(JOB_SETPOINT, False, detail)
-            raise HomeAssistantError(detail) from err
-        except HomeAssistantError as err:
-            detail = f"setting {temperature}F failed: {err}"
-            self._record(JOB_SETPOINT, False, detail)
-            raise HomeAssistantError(detail) from err
+        # The app page is what issues the session cookie the POST needs.
+        async with self._http.get(f"{base}/{PATH_APP}") as page:
+            if page.status != 200:
+                raise HomeAssistantError(f"app page returned {page.status}")
+            await page.text()
+        async with self._http.post(f"{base}/{PATH_SETTEMP}", data=payload) as resp:
+            if resp.status != 200:
+                raise HomeAssistantError(f"settemp returned {resp.status}")
+            await resp.text()
+        reported = await self._read_back(transport, temperature)
 
         if reported is None:
-            detail = (
+            raise HomeAssistantError(
                 f"sent {temperature}F, but the spa's page came back with no "
                 "setpoint at all — that is what the relay renders when the "
                 "WF-100 is off the cloud"
             )
-            self._record(JOB_SETPOINT, False, detail)
-            raise HomeAssistantError(detail)
 
         if reported != temperature:
-            detail = f"sent {temperature}F, but the spa still reports {reported}F"
-            self._record(JOB_SETPOINT, False, detail)
-            raise HomeAssistantError(detail)
+            raise HomeAssistantError(
+                f"sent {temperature}F, but the spa still reports {reported}F"
+            )
 
-        if not await self._link_still_good():
-            detail = (
+        if not await self._link_still_good(transport):
+            raise HomeAssistantError(
                 f"the page echoed {reported}F back, but the relay says it has no "
                 "link to the spa — it would echo either way, so this is not a "
                 "confirmation. The write was sent regardless"
             )
-            self._record(JOB_SETPOINT, False, detail)
-            raise HomeAssistantError(detail)
 
-        self._record(JOB_SETPOINT, True, f"spa confirms {reported}F")
-
-    async def _link_still_good(self) -> bool:
+    async def _link_still_good(self, transport: Transport) -> bool:
         """Whether the relay will vouch for its link to the spa.
 
         Only an explicit denial counts against it. The relay does not always
@@ -321,18 +462,18 @@ class SpaConnection:
         is being asked about went over HTTP and may well have landed.
         """
         try:
-            await self._visit(listen=0)
+            await self._visit(transport, listen=0)
         except (aiohttp.ClientError, OSError, TimeoutError) as err:
             _LOGGER.debug("Could not ask the relay about its link: %s", err)
             return True
         return self.relay_linked is not False
 
-    async def _read_back(self, expected: int) -> int | None:
+    async def _read_back(self, transport: Transport, expected: int) -> int | None:
         """Return the spa's own setpoint, retrying while it settles."""
         reported = None
         for _ in range(CONFIRM_ATTEMPTS):
             await asyncio.sleep(CONFIRM_DELAY_SECONDS)
-            async with self._http.get(f"{self._base_url}/{PATH_APP}") as page:
+            async with self._http.get(f"{self._base_url(transport)}/{PATH_APP}") as page:
                 if page.status != 200:
                     raise HomeAssistantError(f"app page returned {page.status}")
                 reported = parse_setpoint(await page.text())
@@ -347,34 +488,31 @@ class SpaConnection:
     async def async_sync_clock(self, when: datetime) -> None:
         """Set the spa's clock, and record whether it could be delivered.
 
-        The panel takes a 12-hour clock as four digits plus an A or P -- 3:21pm
-        is ``0321P`` -- on the same socket the buttons use.
+        Both modules take the same frame: a 12-hour clock as four digits plus an
+        A or P, so 3:21pm is ``0321P``.
 
-        **This cannot be confirmed.** The clock cannot be read back: the display
-        multiplexes between water temperature and setpoint, never the time. So
-        what is recorded here is delivery, not correctness — the socket opened,
-        the relay did not say it had lost the spa, and the frame went out. That
-        is weaker than the setpoint's confirmation and is labelled as such.
-
-        The filter cycle is the way to close this gap later: FP1 runs noon to
-        3pm spa-local, so a filtering bit that comes on at noon is a clock that
-        is right. `binary_sensor` exposes that bit; nothing acts on it yet.
+        **This records delivery, not correctness.** The socket opened, the relay
+        did not say it had lost the spa, and the frame went out — that is all.
+        The panel *can* now be read back (``decode_clock``), which is new as of
+        November 2026, but a clock frame only appears when the display happens
+        to be cycling the time, so verifying it is a separate job from setting
+        it and is not wired up yet.
         """
-        meridiem = "A" if when.hour < 12 else "P"
-        frame = json.dumps({"time": f"{when:%I%M}{meridiem}"})
+
+        async def attempt(transport: Transport) -> None:
+            await self._visit(transport, send=transport.clock_frame(when))
+
         try:
-            await self._visit(send=frame)
-        except (aiohttp.ClientError, OSError, TimeoutError) as err:
-            detail = f"could not reach the spa to set the clock: {err}"
-            self._record(JOB_CLOCK, False, detail)
-            raise HomeAssistantError(detail) from err
+            used = await self._write(attempt)
         except HomeAssistantError as err:
             detail = f"clock not set: {err}"
             self._record(JOB_CLOCK, False, detail)
             raise HomeAssistantError(detail) from err
 
         self._record(
-            JOB_CLOCK, True, f"clock frame delivered ({when:%-I:%M %p} spa-local)"
+            JOB_CLOCK,
+            True,
+            f"{used.label} took the clock frame ({when:%-I:%M %p} spa-local)",
         )
 
     async def async_take_reading(
@@ -397,7 +535,7 @@ class SpaConnection:
         """
         window = REFRESH_SECONDS if seconds is None else seconds
         try:
-            spoke = await self._visit(listen=window)
+            spoke = await self._visit(self.transport, listen=window)
         except (aiohttp.ClientError, OSError, TimeoutError) as err:
             if record:
                 self._record(JOB_READING, False, f"could not reach the spa: {err}")
@@ -423,10 +561,36 @@ class SpaConnection:
         """Take a reading for a human who asked for one. Never sets the alarm."""
         await self.async_take_reading(record=False)
 
-    async def async_press(self, code: str) -> None:
-        """Send one command code, opening a socket for it."""
+    async def async_press(self, key: str) -> None:
+        """Press one panel key, opening a socket for it.
+
+        Takes a logical key -- ``jets``, ``filter`` -- not a wire code, because
+        the two modules share neither the codes nor the framing: the WF-100
+        wants a bare ``"3"`` and the BT-200 a ``{"keysec":"j0"}``. Sending one
+        module's vocabulary to the other is silently ignored, which is the worst
+        possible outcome, so the transport does the translating.
+
+        No fallback here. These are toggles with no readback, so a retry on the
+        other module cannot tell a dropped press from a doubled one, and a spa
+        whose jets come on and straight back off is worse than one whose button
+        reported an error.
+        """
         try:
-            await self._visit(send=code, listen=REFRESH_SECONDS)
+            frame = self.transport.key_frame(key)
+        except KeyError as err:
+            raise HomeAssistantError(str(err)) from err
+        await self.async_send_raw(frame)
+
+    async def async_send_raw(self, code: str) -> None:
+        """Send one frame exactly as given, for probing undocumented codes.
+
+        Verbatim on purpose: the point of the diagnostic service is to try
+        things this code does not know about, so wrapping or validating the
+        payload would defeat it. On the BT-200 that means passing whole frames
+        such as ``{"keysec":"l0"}``.
+        """
+        try:
+            await self._visit(self.transport, send=code, listen=REFRESH_SECONDS)
         except (aiohttp.ClientError, OSError, TimeoutError) as err:
             raise HomeAssistantError(f"Could not reach the spa: {err}") from err
 
@@ -473,11 +637,22 @@ class SpaConnection:
         self.filtering = bool(flags & FLAG_FILTERING)
 
         # While the edit LED is lit the panel is showing the set temperature
-        # rather than the water temperature, so that reading is not what the
-        # temperature sensor reports.
+        # rather than the water temperature. That reading is not what the
+        # temperature sensor reports -- and it is exactly what confirms a
+        # setpoint write, so it is kept rather than thrown away.
+        #
+        # The edit bit on its own does not make a frame a setpoint: the November
+        # capture includes a *clock* frame carrying it. Requiring a reading that
+        # also decodes as a temperature is what separates them.
         editing = bool(flags & FLAG_EDIT)
         reading = decode_temperature(dsp)
-        if reading is not None and not editing:
+        if reading is None:
+            return True
+        if editing:
+            self._edit_reading = reading[0]
+            self.reported_setpoint = reading[0]
+            _LOGGER.debug("Spa panel shows setpoint %s°%s", *reading)
+        else:
             self.temperature, self.temperature_unit = reading
             self.measured_at = dt_util.utcnow()
             _LOGGER.debug("Spa temperature: %s°%s", *reading)

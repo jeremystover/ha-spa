@@ -8,7 +8,29 @@ import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 
-from .const import CONF_URL, DOMAIN
+from .const import CONF_FALLBACK_URL, CONF_URL, DOMAIN
+
+
+def _check(user_input: dict[str, Any]) -> tuple[str, str | None, dict[str, str]]:
+    """Validate the two URLs, returning them and any field errors.
+
+    The spa has two modules on the panel bus and either can serve as the one the
+    integration drives. Which transport a URL gets is read off its own shape
+    rather than asked for, so there is nothing here to pick -- only the second
+    URL is optional, and it is used solely as somewhere to retry a failed write.
+    """
+    errors: dict[str, str] = {}
+    url = user_input[CONF_URL].strip()
+    if not url.startswith(("ws://", "wss://")):
+        errors[CONF_URL] = "invalid_url"
+
+    fallback = (user_input.get(CONF_FALLBACK_URL) or "").strip() or None
+    if fallback is not None and not fallback.startswith(("ws://", "wss://")):
+        errors[CONF_FALLBACK_URL] = "invalid_url"
+    elif fallback is not None and fallback == url:
+        errors[CONF_FALLBACK_URL] = "same_url"
+
+    return url, fallback, errors
 
 
 class SpaConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -22,21 +44,23 @@ class SpaConfigFlow(ConfigFlow, domain=DOMAIN):
         """Handle the initial step."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            url = user_input[CONF_URL].strip()
-            if not url.startswith(("ws://", "wss://")):
-                errors[CONF_URL] = "invalid_url"
-            else:
+            url, fallback, errors = _check(user_input)
+            if not errors:
                 await self.async_set_unique_id(url)
                 self._abort_if_unique_id_configured()
+                data: dict[str, Any] = {CONF_URL: url}
+                if fallback is not None:
+                    data[CONF_FALLBACK_URL] = fallback
                 return self.async_create_entry(
                     title=user_input.get("name", "Spa").strip() or "Spa",
-                    data={CONF_URL: url},
+                    data=data,
                 )
 
         schema = vol.Schema(
             {
                 vol.Required("name", default="Spa"): str,
                 vol.Required(CONF_URL): str,
+                vol.Optional(CONF_FALLBACK_URL, default=""): str,
             }
         )
         return self.async_show_form(
@@ -56,6 +80,10 @@ class SpaConfigFlow(ConfigFlow, domain=DOMAIN):
         far more common; it keeps the same token and is fixed at the module, not
         in Home Assistant. See docs/PROTOCOL.md before reaching for a new URL.
 
+        It is also how you move between the spa's two modules: paste the
+        BT-200's ``/wsa/`` URL here and the integration drives that one instead,
+        with the WF-100's URL kept below as somewhere to retry a failed write.
+
         Recovering has to be an edit rather than a delete-and-re-add, because
         every entity's unique_id is derived from the config entry's id. A new
         entry mints a new id, and with it a whole new set of entities under new
@@ -67,19 +95,25 @@ class SpaConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            url = user_input[CONF_URL].strip()
-            if not url.startswith(("ws://", "wss://")):
-                errors[CONF_URL] = "invalid_url"
-            else:
+            url, fallback, errors = _check(user_input)
+            if not errors:
                 # The entry's own unique_id is the URL, so a rotated token has
                 # to move it too, or the entry keeps claiming the dead one.
                 await self.async_set_unique_id(url)
                 return self.async_update_reload_and_abort(
-                    entry, unique_id=url, data_updates={CONF_URL: url}
+                    entry,
+                    unique_id=url,
+                    data_updates={CONF_URL: url, CONF_FALLBACK_URL: fallback},
                 )
 
         schema = vol.Schema(
-            {vol.Required(CONF_URL, default=entry.data[CONF_URL]): str}
+            {
+                vol.Required(CONF_URL, default=entry.data[CONF_URL]): str,
+                vol.Optional(
+                    CONF_FALLBACK_URL,
+                    default=entry.data.get(CONF_FALLBACK_URL) or "",
+                ): str,
+            }
         )
         return self.async_show_form(
             step_id="reconfigure", data_schema=schema, errors=errors

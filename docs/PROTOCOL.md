@@ -157,8 +157,9 @@ parks the water on the freeze-protection trigger — the controller shows `CoLd`
 below 40 °F and runs the pump until it recovers past 45 °F — fine to touch
 briefly, not to hold overnight through a freezing winter.
 
-`GET /app` also exposes the current setpoint as the form's `value` attribute,
-which is a cleaner readback than the multiplexed display. Not yet wired up.
+`GET /app` also exposes the current setpoint as the form's `value` attribute.
+That is the readback this path uses — see **Confirming a write** for how far it
+is believed, which is not very far.
 
 ## The BT-200 speaks the same protocol, better
 
@@ -201,6 +202,44 @@ and the setpoint appears in a `dsp` frame with the edit bit lit.
 
 `keysec` codes are still toggles, so a pump cannot be set to a speed, only
 cycled. Confirmed rather than assumed this time.
+
+### Which module a URL belongs to
+
+Read off the URL's own shape rather than configured: `/wsa/<12 hex>/[MN]/` is
+the BT-200, anything else the WF-100. There is nothing to choose — a `keysec`
+frame means nothing to the web relay and a bare `"3"` means nothing to the
+BT-200 — so letting the two disagree would only create a way to be wrong.
+
+A second URL may be configured as somewhere to retry a failed write. **That is
+not a second path to the spa.** Both modules go through the same relay, so a
+relay outage takes both down together. What it covers is one module dropping off
+the cloud while the other stays up, which is exactly what the WF-100 did in
+September 2026 and the only reason it is worth keeping a dead module's URL.
+
+### Byte 4 bit 0x80: the display is showing the clock
+
+Not in the web app's LED map, and found by sorting the November capture's 27
+distinct frames by what they decode as:
+
+| | byte 4 |
+| --- | --- |
+| every clock frame | `0x80` set |
+| every temperature frame | `0x80` clear |
+
+`0686bf06` **80** `00` is 10:11; `f16d6d00` **00** `00` is 55 °F; `f16f6f00`
+**20** `00` is a setpoint with the edit LED lit. The separation holds across all
+27 frames with no exceptions, which makes this a stronger signature for a clock
+frame than the absence of a scale marker.
+
+The decoder does not use it. The scale-marker rule is verified against the same
+27 frames and cannot collide in practice — no clock digit rotates into an `F` or
+a `C` — so a second rule would add a way for the two to disagree without adding
+any coverage. Recorded here because the next person to find a frame that decodes
+as neither will want it.
+
+Note also that **the edit bit does not mean "setpoint"**: `5b86bf06a000` is a
+clock frame carrying it. What identifies a setpoint is the edit bit *plus* a
+reading that decodes as a temperature.
 
 ## Setting the clock
 
@@ -348,17 +387,23 @@ the reasoning under Status frames above.
 
 ## Confirming a write
 
-`GET /app` renders the spa's live setpoint into the form it returns:
+There are two readbacks, and they are not of comparable quality.
+
+**On the BT-200, the panel's own display.** Send `{"temp":"101F"}` and the
+setpoint comes back in a `dsp` frame with the edit LED lit. This is the good
+one: the display is the panel's output, so it cannot show a number the panel
+does not hold, and while the panel is in edit mode it repeats that frame
+steadily — the November capture has the three setpoints pressed appearing 32, 32
+and 16 times. What is *not* established is how long edit mode persists after the
+last press, which is why the listening window is generous rather than tight.
+
+**On the WF-100, `GET /app`**, which renders the live setpoint into its form:
 
 ```html
 <input type="number" name="void" ... value="85">
 ```
 
-That is the readback, and it is the only honest one — the display multiplexes
-between water temperature and setpoint, so a frame cannot be trusted to be
-either.
-
-Two rules learned the hard way:
+Two rules learned the hard way on that path:
 
 - **Use a fresh page load, not the POST's echo.** Whether `settemp` echoes the
   new value or the pre-write one has never been established against the
@@ -369,16 +414,35 @@ Two rules learned the hard way:
   diagnostic response this API produces, and it is what two days of cold water
   looked like from the outside.
 
-The clock has no equivalent and cannot be confirmed at all. The nearest proxy is
-the filter cycle, which is programmed against the same clock: FP1 runs noon to
-3pm spa-local, so a filtering bit (`0x10`) that comes on at noon is a clock that
-is right. Unverified — recorded so it can be checked against real days.
+Even then the page is only believed as far as the relay will vouch for its link,
+because a page that repeats what you just wrote confirms nothing. The relay's
+own `stsR` is asked **after** the write and never allowed to withhold one: on
+8 September it reported no link at 07:00 and the spa heated perfectly that
+afternoon.
+
+The clock is delivered rather than confirmed. It *can* now be read back
+(`decode_clock`), but only when the display happens to be cycling the time, so
+verifying it is a separate job from setting it and is not wired up. The nearest
+proxy remains the filter cycle, programmed against the same clock: FP1 runs noon
+to 3pm spa-local, so a filtering bit (`0x10`) that comes on at noon is a clock
+that is right. Unverified — recorded so it can be checked against real days.
 
 ## Open questions
 
+- **Whether `/wsa/` accepts frames from a client that is not the app.** The
+  `M` in the path reads as "master" and the app enforces one connection at a
+  time over Bluetooth; if the relay restricts the socket the same way, a
+  connection from Home Assistant could fight with the phone. Everything about
+  the BT-200 path here is derived from a capture of the app, not from driving
+  the endpoint — so this is the one question that has to be answered against
+  the hardware before any of it is trusted.
+- Whether a guest (`N`) token can write, or is read-only. If it can, the
+  integration should run on one: revoking a guest does not re-pair the spa.
 - Button code `4` is labelled **Filter** here; the web app calls it `system`.
+  The BT-200 agrees with the web app — its code is `s0`.
 - Whether `/wsb` accepts every frame `/wsa` does. Only the clock frame has been
   checked.
-- The setpoint readback from `GET /app` is available but unused; `number.*`
-  reports only the last value Home Assistant wrote and shows `unknown` until it
-  writes one.
+- The BT-200's light key (`{"keysec":"l0"}`) is captured and documented but no
+  entity presses it. There is no known WF-100 equivalent, which is why nothing
+  was added: a button that works on one module and silently does nothing on the
+  other is worse than no button.

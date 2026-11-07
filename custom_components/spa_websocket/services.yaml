@@ -1,15 +1,19 @@
 send_raw:
   name: Send raw command
   description: >-
-    Send a single raw command code to the spa over its WebSocket. Diagnostic
-    tool for mapping the spa's undocumented command codes (known so far:
-    "3" toggles jets, "4" toggles filter).
+    Send a single frame to the spa over its WebSocket, exactly as typed.
+    Diagnostic tool for probing codes this integration does not know about, so
+    nothing is wrapped or validated for you -- which means the payload depends
+    on which module you are driving. The WF-100 web relay takes bare codes
+    ("3" toggles jets, "4" toggles filter); the BT-200 takes whole frames
+    ({"keysec":"l0"} for the light, {"keysec":"j0"} jets, {"keysec":"s0"}
+    system). Sending one module's vocabulary to the other is ignored silently.
   fields:
     code:
       name: Code
-      description: The raw command code to send, e.g. "3".
+      description: The frame to send, verbatim.
       required: true
-      example: "3"
+      example: '{"keysec":"l0"}'
       selector:
         text:
 
@@ -19,9 +23,8 @@ set_time:
     Set the spa's clock to the current time. The filter cycles are programmed
     against this clock and it does not survive a power cut, so re-asserting it
     on a schedule is what keeps the filter window lined up with the setpoint.
-    The clock cannot be read back, so this always writes rather than checking
-    first -- which is harmless, since writing the correct time to an already
-    correct clock changes nothing.
+    This always writes rather than checking first, which is harmless: writing
+    the correct time to an already correct clock changes nothing.
   fields:
     timezone:
       name: Timezone
