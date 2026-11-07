@@ -608,5 +608,45 @@ for frame in ("f10000000000", "5b0600008000", "00003f068000"):
     check(f"{frame} clock", decode_clock(frame), None)
 
 
+# =============================================================================
+# Found by moving a live entry onto a URL another entry already held, on 7
+# November 2026, while testing the BT-200 against the real spa. Home Assistant
+# only notices afterwards, and reports it as a bug in this integration.
+print("\n=== two entries cannot claim one URL ===")
+print("  (an entry's unique_id IS its URL, so moving one onto another's leaves")
+print("   both claiming the same id -- HA logs 'already in use ... bug report')")
+_cfg = types.ModuleType("voluptuous")
+_cfg.Schema = _cfg.Required = _cfg.Optional = lambda *a, **k: None
+sys.modules["voluptuous"] = _cfg
+
+
+class _ConfigFlow:
+    """Stand in for HA's ConfigFlow, which takes a domain= class keyword."""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__()
+
+
+_mod("homeassistant.config_entries", ConfigFlow=_ConfigFlow,
+     ConfigFlowResult=dict, ConfigEntry=object)
+from spa_websocket.config_flow import _check  # noqa: E402
+
+MINE, THEIRS = RELAY_URL, PANEL_URL
+check("a free URL is fine", _check({"url": MINE}, {THEIRS})[2], {})
+check("a URL another entry holds is refused",
+      _check({"url": THEIRS}, {THEIRS})[2], {"url": "url_in_use"})
+check("keeping your own URL is not a conflict",
+      _check({"url": MINE}, set())[2], {})
+check("not a ws URL at all", _check({"url": "https://h/x"}, set())[2],
+      {"url": "invalid_url"})
+check("the fallback cannot be the primary",
+      _check({"url": MINE, "fallback_url": MINE}, set())[2],
+      {"fallback_url": "same_url"})
+check("a blank fallback is simply absent",
+      _check({"url": MINE, "fallback_url": "  "}, set()), (MINE, None, {}))
+check("both URLs kept", _check({"url": MINE, "fallback_url": THEIRS}, set()),
+      (MINE, THEIRS, {}))
+
+
 print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
 sys.exit(1 if fails else 0)
