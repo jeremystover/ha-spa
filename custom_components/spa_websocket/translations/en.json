@@ -27,7 +27,8 @@
     },
     "error": {
       "invalid_url": "The URL must start with ws:// or wss://.",
-      "same_url": "The second URL has to be a different module, not the same one again."
+      "same_url": "The second URL has to be a different module, not the same one again.",
+      "url_in_use": "Another spa entry already uses that URL. Each entry's identity is its URL, so two cannot share one."
     },
     "abort": {
       "already_configured": "This spa URL is already configured."

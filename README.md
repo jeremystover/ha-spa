@@ -52,8 +52,13 @@ panel bus and either will do:
 
 | | |
 | --- | --- |
-| `wss://accsmartlink.com/wsa/<mac>/M/<id>/<token>` | **BT-200** — prefer this |
+| `wss://accsmartlink.com/wsa/<mac>/N/<id>/<token>` | **BT-200 guest** — prefer this |
+| `wss://accsmartlink.com/wsa/<mac>/M/<id>/<token>` | BT-200 master |
 | `wss://accsmartlink.com/spa/<token>/wsb` | WF-100, the legacy web relay |
+
+Prefer the **guest** (`N`) token, from the app's Share link. It writes — tested
+7 November 2026 — and it is revocable, so losing it does not mean re-pairing the
+spa the way a leaked master token does.
 
 Prefer the BT-200 because the setpoint is a socket frame confirmed against the
 panel's own display. On the WF-100 it is a form POST confirmed against a page

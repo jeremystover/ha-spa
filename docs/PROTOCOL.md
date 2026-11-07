@@ -427,17 +427,34 @@ proxy remains the filter cycle, programmed against the same clock: FP1 runs noon
 to 3pm spa-local, so a filtering bit (`0x10`) that comes on at noon is a clock
 that is right. Unverified — recorded so it can be checked against real days.
 
+## Driven against the hardware, 7 November 2026
+
+The BT-200 path was derived from a capture of the app, so none of it was known
+to work from anything else. It does. Run from Home Assistant on the **guest**
+token, with the WF-100 six days off the cloud:
+
+| | |
+| --- | --- |
+| `/wsa/` accepts a non-app client | **yes** — frames arrived inside the first 30s window |
+| a guest (`N`) token can write | **yes** — `{"temp":"101F"}` was accepted |
+| the setpoint confirms off the display | **yes** — `BT-200 confirms 101F` |
+| the clock frame is accepted | **yes** — delivered, 11:15 AM spa-local |
+| water temperature decodes live | **yes** — 88 °F, then 89 °F three minutes later |
+
+Two details worth keeping.
+
+**Re-asserting an unchanged setpoint still echoes.** Writing 101 to a panel
+already holding 101 produced an edit-flagged frame anyway, so confirmation does
+not depend on the value changing. That matters: without it, every re-assertion
+of a setpoint the spa already had would have to be reported as unconfirmed.
+
+**The first frame back was a clock frame.** It carried the LED bitfield — the
+heating and jets bits updated — with no temperature, exactly the
+`5b063f068500` shape from the capture. The two decoders separated live traffic
+correctly on the first try, and a temperature frame followed on the next visit.
+
 ## Open questions
 
-- **Whether `/wsa/` accepts frames from a client that is not the app.** The
-  `M` in the path reads as "master" and the app enforces one connection at a
-  time over Bluetooth; if the relay restricts the socket the same way, a
-  connection from Home Assistant could fight with the phone. Everything about
-  the BT-200 path here is derived from a capture of the app, not from driving
-  the endpoint — so this is the one question that has to be answered against
-  the hardware before any of it is trusted.
-- Whether a guest (`N`) token can write, or is read-only. If it can, the
-  integration should run on one: revoking a guest does not re-pair the spa.
 - Button code `4` is labelled **Filter** here; the web app calls it `system`.
   The BT-200 agrees with the web app — its code is `s0`.
 - Whether `/wsb` accepts every frame `/wsa` does. Only the clock frame has been
