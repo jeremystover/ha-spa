@@ -53,7 +53,12 @@ from spa_websocket.const import (  # noqa: E402
     JOB_READING,
     JOB_SETPOINT,
 )
-from spa_websocket.decode import decode_temperature, plausible  # noqa: E402
+from spa_websocket.decode import (  # noqa: E402
+    decode_clock,
+    decode_temperature,
+    panel_flipped,
+    plausible,
+)
 
 HomeAssistantError = sys.modules["homeassistant.exceptions"].HomeAssistantError
 
@@ -382,6 +387,42 @@ print("\nreal frames still decode:")
 check("upright 92F", decode_temperature("f15b6f000500"), (92, "F"))
 check("flipped 96F", decode_temperature("007d6fce1400"), (96, "F"))
 check("ECon is not a temperature", decode_temperature("4f0f63620000"), None)
+
+# --- the clock, in the display ---------------------------------------------
+# Every frame below was captured from the BT-200 on 7 November 2026, while the
+# panel clock read 10:11 then 10:12.
+print("\n=== the clock is in the display, so it can finally be verified ===")
+print("  (until this decoded, setting the spa's clock was write-only)")
+for frame, want in [
+    ("0686bf068000", (10, 11)),   # colon lit
+    ("06063f068000", (10, 11)),   # colon dark -- it blinks, so it is no signature
+    ("5b86bf06a000", (10, 12)),
+    ("5b063f068500", (10, 12)),   # heating and low jets on the same frame
+]:
+    check(f"{frame}", decode_clock(frame), want)
+
+print("\nthe two readings never collide:")
+for frame in ("f16d6d000000", "f13f3f062000", "f1063f062000"):
+    check(f"{frame} is not a clock", decode_clock(frame), None)
+for frame in ("0686bf068000", "5b86bf06a000"):
+    check(f"{frame} is not a temperature", decode_temperature(frame), None)
+
+print("\nthe setpoint you pressed, read back off the panel's own display:")
+print("  (this is a real confirmation -- the old HTTP readback was a mirror)")
+check("100F before the change", decode_temperature("f13f3f062000"), (100, "F"))
+check("99F after temp-down", decode_temperature("f16f6f002000"), (99, "F"))
+check("101F after temp-up", decode_temperature("f1063f062000"), (101, "F"))
+
+print("\norientation comes from the scale marker, which a clock frame lacks:")
+check("upright", panel_flipped("f16d6d000000"), False)
+check("flipped", panel_flipped("007d6fce1400"), True)
+check("a clock frame cannot say", panel_flipped("0686bf068000"), None)
+
+print("\npartial frames mid-refresh are neither:")
+for frame in ("f10000000000", "5b0600008000", "00003f068000"):
+    check(f"{frame} temp", decode_temperature(frame), None)
+    check(f"{frame} clock", decode_clock(frame), None)
+
 
 print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
 sys.exit(1 if fails else 0)
