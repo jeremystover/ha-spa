@@ -55,6 +55,7 @@ from .const import (
     KEY_RELAY_STATUS,
     PATH_APP,
     PATH_SETTEMP,
+    READING_AFTER_SETPOINT_SECONDS,
     REFRESH_SECONDS,
     RELAY_ANSWER_SECONDS,
     SETPOINT_ECHO_SECONDS,
@@ -353,6 +354,13 @@ class SpaConnection:
         capture includes a *clock* frame with it lit. What makes one is the edit
         bit plus a reading that decodes as a temperature, which is what
         ``_handle_message`` requires before recording anything here.
+
+        Once it confirms, the socket stays open a little longer to catch a water
+        reading. That is not tidiness: the confirmation frames are the setpoint
+        *because* the write put the panel into edit mode, so a visit that stops
+        at the confirmation learns the spa accepted a number and nothing about
+        whether the water followed. The old HTTP path got the reading for free
+        and this one has to ask for it.
         """
         frame = transport.setpoint_frame(temperature)
         if frame is None:  # pragma: no cover - transport.is_panel guards this
@@ -367,11 +375,13 @@ class SpaConnection:
             # perfectly that afternoon. Sending into a dead module costs
             # nothing; not sending into a live one costs the whole day.
             await ws.send_str(frame)
-            await self._listen(
+            confirmed = await self._listen(
                 ws,
                 SETPOINT_ECHO_SECONDS,
                 done=lambda: self._edit_reading == temperature,
             )
+            if confirmed:
+                await self._listen_for_water(ws)
         shown = self._edit_reading
         self._notify_listeners()
 
@@ -386,6 +396,27 @@ class SpaConnection:
             )
         self.reported_setpoint = shown
         self.setpoint_confirmed_at = dt_util.utcnow()
+
+    async def _listen_for_water(self, ws: aiohttp.ClientWebSocketResponse) -> bool:
+        """Wait on an open socket for a frame carrying the water temperature.
+
+        Strictly best effort, and it must stay that way: this runs after a
+        setpoint has already been confirmed, so a quiet panel here means the
+        reading is old, not that the write failed. Nothing it does can change
+        the setpoint job's verdict, and silence is never recorded as a failure.
+
+        It waits for ``measured_at`` to move rather than for any frame at all.
+        The panel multiplexes three ways, and the frames most likely to turn up
+        right after a write are the setpoint and the clock -- neither of which
+        says anything about the water. Returning on the first frame of any kind
+        would look like success and deliver nothing.
+        """
+        before = self.measured_at
+        return await self._listen(
+            ws,
+            READING_AFTER_SETPOINT_SECONDS,
+            done=lambda: self.measured_at != before,
+        )
 
     async def _setpoint_on_relay(
         self, transport: Transport, temperature: int

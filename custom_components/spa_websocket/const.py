@@ -112,6 +112,24 @@ CONFIRM_DELAY_SECONDS = 5
 # that asked for it.
 SETPOINT_ECHO_SECONDS = 45
 
+# After a setpoint confirms, how long to keep the socket open waiting for a
+# WATER temperature frame.
+#
+# This exists because moving the setpoint onto the socket quietly cost us the
+# reading. The write puts the panel into edit mode -- it displays the setpoint,
+# which is exactly what makes the confirmation possible -- so every frame during
+# the confirmation is the setpoint, never the water. The old HTTP path got a
+# reading for free, because the socket visit that followed its POST was a pure
+# listen. On 7 November 2026 that showed up as four confirmed setpoint jobs
+# across the afternoon window and a water temperature five hours stale: the spa
+# demonstrably accepted 101F, and nothing could say whether the water moved.
+#
+# Confirming a setpoint and knowing the water followed are different questions,
+# and this is the second one. Best effort, always: the socket is already open so
+# the only cost is the wait, and silence here never touches the setpoint job's
+# own verdict.
+READING_AFTER_SETPOINT_SECONDS = 90
+
 # The scheduled jobs, named so a failure can say which one.
 JOB_SETPOINT = "setpoint"
 JOB_CLOCK = "clock"

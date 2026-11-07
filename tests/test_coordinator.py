@@ -73,6 +73,7 @@ coord.RELAY_ANSWER_SECONDS = 0.01
 coord.VISIT_SECONDS = 0.01
 coord.REFRESH_SECONDS = 0.01
 coord.SETPOINT_ECHO_SECONDS = 0.05
+coord.READING_AFTER_SETPOINT_SECONDS = 0.05
 
 FRAME = '{"dsp":"007d30ce0500"}'          # 91F, heating + low jets
 FILTER_FRAME = '{"dsp":"007d30ce1000"}'   # filtering bit set
@@ -378,6 +379,41 @@ except HomeAssistantError as err:
     check("raised", True, True)
     check("did not reuse the 101", "never showed a setpoint" in str(err), True)
 check("job recorded failed", c.jobs[JOB_SETPOINT].ok, False)
+
+print("\nthe setpoint job also comes back with a WATER reading:")
+print("  (7 Nov 2026: four confirmed setpoint jobs across the afternoon window")
+print("   and a water temperature five hours stale. The write puts the panel in")
+print("   edit mode, so every confirmation frame is the setpoint -- a visit that")
+print("   stops there proves the spa took a number and nothing about the water)")
+c = new_panel(frames=[SETPOINT_FRAMES[101], FRAME])
+run(c.async_apply_setpoint(101))
+check("setpoint confirmed", c.jobs[JOB_SETPOINT].detail, "BT-200 confirms 101F")
+check("and the water was read too", c.temperature, 91)
+check("measured_at stamped", c.measured_at, NOW[0])
+
+print("\nthe clock frames that actually turn up first do not end the wait:")
+print("  (three Refresh presses that night returned clock frames only; stopping")
+print("   on the first frame of any kind would look like success and deliver")
+print("   nothing)")
+c = new_panel(frames=[SETPOINT_FRAMES[101], CLOCK_EDIT_FRAME, FRAME])
+run(c.async_apply_setpoint(101))
+check("still got the water", c.temperature, 91)
+
+print("\nbut a quiet panel afterwards NEVER undoes the confirmation:")
+print("  (the write already landed; a stale reading is not a failed setpoint)")
+c = new_panel(frames=[SETPOINT_FRAMES[101]])
+run(c.async_apply_setpoint(101))
+check("setpoint still ok", c.jobs[JOB_SETPOINT].ok, True)
+check("nothing failing", c.failing, [])
+check("no water reading invented", c.temperature, None)
+
+print("\nand a setpoint that never confirms does not wait around for water:")
+c = new_panel(frames=[FRAME])
+try:
+    run(c.async_apply_setpoint(101))
+    check("raised", False, True)
+except HomeAssistantError:
+    check("raised", True, True)
 
 print("\nan edit frame caught on any visit updates the reported setpoint:")
 c = new_panel(frames=[SETPOINT_FRAMES[100]])
